@@ -1,0 +1,7 @@
+requests==2.31.0
+pandas==2.1.4
+python-telegram-bot==20.7
+flask==3.0.0
+schedule==1.2.1
+gunicorn==21.2.0
+nest_asyncio==1.6.0
