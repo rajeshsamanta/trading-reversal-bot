@@ -12,14 +12,14 @@ import sys
 sys.stdout.reconfigure(line_buffering=True)
 
 # ============ CONFIGURATION ============
-TELEGRAM_TOKEN = "8776819788:AAHfoFM_82byoGtR3q6jB0PKHw5S45GBqJI"          # <-- আপনার নতুন Bot Token এখানে বসান
+TELEGRAM_TOKEN = "8776819788:AAHfoFM_82byoGtR3q6jB0PKHw5S45GBqJI"          # <-- আপনার নতুন Bot Token বসান
 CHAT_ID = "-1003988993524"                 # আপনার Channel Chat ID
 
 SYMBOL = "BTC-USDT-SWAP"
 TIMEFRAME = "15m"
 LOWER_TF = "1m"
-LIMIT = 300                                # 300 candles
-LOWER_LIMIT = 1000                         # 1m candles for delta calculation
+LIMIT = 300
+LOWER_LIMIT = 1000
 VOLUME_LOOKBACK = 50
 OI_LOOKBACK = 42
 
@@ -37,6 +37,7 @@ OI_ENTRY_MULT = 1.5
 OI_EXIT_MULT = 1.0
 OI_BUILD_MIN_ABS_15M = 110.0
 OI_EXIT_MIN_ABS_15M = 120.0
+DIVERGENCE_EVENT_MULT = 1.2   # Pine Script-এর মতো
 
 IN_TZ = ZoneInfo("Asia/Kolkata")
 
@@ -135,7 +136,7 @@ def calculate_delta(df_main):
     df_main["delta_share"] = abs(df_main["delta"]) / df_main["vol"].clip(lower=1)
     return df_main
 
-# ============ SIGNALS ============
+# ============ SIGNAL CALCULATION ============
 def calculate_signals(df):
     oi_records = get_oi_history(TIMEFRAME, LIMIT)
     oi_map = {rec["time"]: rec["oi"] for rec in oi_records}
@@ -148,6 +149,7 @@ def calculate_signals(df):
 
     df["volume_base"] = df["vol"].rolling(VOLUME_LOOKBACK).mean()
 
+    # Reversal data
     df["prior_high"] = df["high"].shift(1).rolling(REVERSAL_SWING_LOOKBACK).max()
     df["prior_low"] = df["low"].shift(1).rolling(REVERSAL_SWING_LOOKBACK).min()
     df["impulse_high"] = df["high"].shift(1).rolling(REVERSAL_IMPULSE_LOOKBACK).max()
@@ -194,6 +196,7 @@ def calculate_signals(df):
     df["candle_up"] = df["close"] > df["open"]
     df["candle_down"] = df["close"] < df["open"]
 
+    # Short cover / Long liquidation (Reversal data tool)
     df["short_cover"] = (
         df["candle_up"] &
         (df["delta"] > 0) &
@@ -222,19 +225,23 @@ def calculate_signals(df):
         df["volume_pass"].astype(int)
     )
 
+    # OI entry/exit move
     df["oi_entry_move_ok"] = (df["oi_delta"].abs() >= df["oi_abs_base"] * OI_ENTRY_MULT) & (df["oi_delta"].abs() >= OI_BUILD_MIN_ABS_15M)
     df["oi_exit_move_ok"] = (df["oi_delta"].abs() >= df["oi_abs_base"] * OI_EXIT_MULT) & (df["oi_delta"].abs() >= OI_EXIT_MIN_ABS_15M)
 
+    # New buyers / New sellers
     df["new_buyers_raw"] = df["oi_entry_move_ok"] & df["oi_increase"] & df["candle_up"]
     df["new_sellers_raw"] = df["oi_entry_move_ok"] & df["oi_increase"] & df["candle_down"]
 
-    df["buyers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_down"]
-    df["sellers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_up"]
+    # Buyers exiting / Sellers exiting (inverted labels per user)
+    df["buyers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_down"]   # => SELLER EXIT
+    df["sellers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_up"]    # => BUYER EXIT
 
-    # Trap/force exit conditions
+    # Trapped (separate signals)
     df["trapped_buyers_raw"] = df["candle_up"] & df["oi_decrease"] & (df["delta"] < 0)
     df["trapped_sellers_raw"] = df["candle_down"] & df["oi_decrease"] & (df["delta"] > 0)
 
+    # Bull/Bear shift (deep blue)
     df["bull_shift_raw"] = (
         (df["vol"] >= df["volume_base"] * DEEP_BLUE_VOLUME_MULT) &
         (df["delta_share"] >= DEEP_BLUE_DELTA_SHARE) &
@@ -248,9 +255,21 @@ def calculate_signals(df):
         df["candle_down"]
     )
 
+    # OI Divergence
+    df["flow_disagrees"] = (df["candle_up"] & (df["delta"] < 0)) | (df["candle_down"] & (df["delta"] > 0))
+    df["divergence_move_ok"] = df["oi_delta"].abs() >= df["oi_abs_base"] * DIVERGENCE_EVENT_MULT
+    df["bullish_divergence"] = df["divergence_move_ok"] & df["candle_down"] & (df["delta"] > 0)
+    df["bearish_divergence"] = df["divergence_move_ok"] & df["candle_up"] & (df["delta"] < 0)
+
+    # Confirmed / Failed Reversals (based on previous candle candidate)
+    df["bull_confirmed"] = df["bull_reversal_candidate"].shift(1) & (df["close"] > df["high"].shift(1))
+    df["bear_confirmed"] = df["bear_reversal_candidate"].shift(1) & (df["close"] < df["low"].shift(1))
+    df["bull_failed"] = df["bull_reversal_candidate"].shift(1) & (df["close"] < df["low"].shift(1))
+    df["bear_failed"] = df["bear_reversal_candidate"].shift(1) & (df["close"] > df["high"].shift(1))
+
     return df
 
-# ============ FORMAT HELPERS ============
+# ============ HELPERS ============
 def strength_text(score, max_score):
     return "Strong" if score >= max_score - 1 else "Medium" if score >= max_score - 2 else "Watch"
 
@@ -308,7 +327,7 @@ def trap_exit_text(row):
         parts.append("Exit: Sellers exiting")
     return " | ".join(parts) if parts else "Trap / Force Exit: none"
 
-# ============ REVERSAL TOOLTIP ============
+# ============ MESSAGE BUILDERS ============
 def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
     if signal_type == "SHORT_COVER":
         title = f"SHORT COVER [{strength_text(row['short_cover_score'], 4)}]"
@@ -346,6 +365,42 @@ def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
         level = f"Flush Low: {row['prior_low']:.1f}"
         score = f"{int(row['bear_score'])}/6"
         confirm = f"SELL only on close below {row['low']:.1f}"
+    elif signal_type == "CONFIRMED_BULL":
+        title = "CONFIRMED BULL REVERSAL"
+        detail = "Closed above the reversal candle high - follow-through in"
+        bias = "UP"
+        invalid = f"below {row['low']:.1f} (flush low)"
+        next_text = "UP - follow-through / squeeze possible"
+        level = f"Squeeze High: {row['high']:.1f}"
+        score = f"{int(row['bull_score'])}/6"
+        confirm = f"Buy confirmed above {row['high']:.1f}"
+    elif signal_type == "CONFIRMED_BEAR":
+        title = "CONFIRMED BEAR REVERSAL"
+        detail = "Closed below the reversal candle low - follow-through in"
+        bias = "DOWN"
+        invalid = f"above {row['high']:.1f} (squeeze high)"
+        next_text = "DOWN - continuation risk"
+        level = f"Flush Low: {row['low']:.1f}"
+        score = f"{int(row['bear_score'])}/6"
+        confirm = f"Sell confirmed below {row['low']:.1f}"
+    elif signal_type == "BULL_FAILED":
+        title = "REVX - BULL REVERSAL FAILED"
+        detail = "Price failed the bullish reversal setup"
+        bias = "DOWN / CONTINUATION RISK"
+        invalid = f"below {row['low']:.1f}"
+        next_text = "DOWN - continuation risk"
+        level = f"Flush Low: {row['low']:.1f}"
+        score = f"{int(row['bull_score'])}/6"
+        confirm = f"Buy only above {row['high']:.1f}"
+    elif signal_type == "BEAR_FAILED":
+        title = "REVX - BEAR REVERSAL FAILED"
+        detail = "Price failed the bearish reversal setup"
+        bias = "UP / CONTINUATION RISK"
+        invalid = f"above {row['high']:.1f}"
+        next_text = "UP - squeeze possible"
+        level = f"Squeeze High: {row['high']:.1f}"
+        score = f"{int(row['bear_score'])}/6"
+        confirm = f"Sell only below {row['low']:.1f}"
     else:
         return ""
 
@@ -365,28 +420,50 @@ def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
         f"V {format_volume(row['vol'])} · Δ {format_delta(row['delta'])} · OI {format_delta(row['oi_delta'])}"
     )
 
-# ============ MONEY FLOW TOOLTIP ============
 def build_moneyflow_tooltip(row, signal_type, timeframe, candle_time):
     time_str = to_indian_time(candle_time)
     header = f"🕐 {timeframe} | {time_str}\n"
 
+    # For black dot signals we override flow and exit text as per user requirement
+    if signal_type == "SELLER_EXIT":
+        title = "⚫ SELLER EXIT"
+        detail = f"Price: {row['close']:.1f}"
+        flow = "Flow: Buyers stronger"
+        exit_text = "Exit: Sellers Exiting"
+        oi_line = f"OI Change: {format_delta(row['oi_delta'])}"
+        return header + f"{title}\n{detail}\n{flow}\n{oi_line}\n{exit_text}\n"
+    elif signal_type == "BUYER_EXIT":
+        title = "⚫ BUYER EXIT"
+        detail = f"Price: {row['close']:.1f}"
+        flow = "Flow: Sellers Stronger"
+        exit_text = "Exit: Buyer Exiting"
+        oi_line = f"OI Change: {format_delta(row['oi_delta'])}"
+        return header + f"{title}\n{detail}\n{flow}\n{oi_line}\n{exit_text}\n"
+
+    # For other money flow signals, keep detailed format
     if signal_type == "NEW_BUYERS":
         title = "🟢 NEW BUYERS ENTRY"
         detail = f"Price: {row['close']:.1f}"
     elif signal_type == "NEW_SELLERS":
         title = "🔴 NEW SELLERS ENTRY"
         detail = f"Price: {row['close']:.1f}"
-    elif signal_type == "SELLER_EXIT":
-        title = "⚫ SELLER EXIT"
-        detail = f"Price: {row['close']:.1f}"
-    elif signal_type == "BUYER_EXIT":
-        title = "⚫ BUYER EXIT"
-        detail = f"Price: {row['close']:.1f}"
     elif signal_type == "BULLISH_FLOW":
         title = "🟢 BULLISH MONEY FLOW"
         detail = f"Price: {row['close']:.1f}"
     elif signal_type == "BEARISH_FLOW":
         title = "🔴 BEARISH MONEY FLOW"
+        detail = f"Price: {row['close']:.1f}"
+    elif signal_type == "BULLISH_DIVERGENCE":
+        title = "🟢 OI DIVERGENCE - BULLISH"
+        detail = f"Price: {row['close']:.1f}"
+    elif signal_type == "BEARISH_DIVERGENCE":
+        title = "🔴 OI DIVERGENCE - BEARISH"
+        detail = f"Price: {row['close']:.1f}"
+    elif signal_type == "TRAPPED_BUYERS":
+        title = "⚠️ TRAPPED BUYERS"
+        detail = f"Price: {row['close']:.1f}"
+    elif signal_type == "TRAPPED_SELLERS":
+        title = "⚠️ TRAPPED SELLERS"
         detail = f"Price: {row['close']:.1f}"
     else:
         return ""
@@ -428,7 +505,7 @@ def check_and_alert():
     df = calculate_delta(df)
     df = calculate_signals(df)
 
-    if len(df) < 2:
+    if len(df) < 3:
         return
 
     period_ms = (
@@ -439,11 +516,12 @@ def check_and_alert():
     current_ms = int(time.time() * 1000)
     last_start = int(df["time"].iloc[-1])
 
+    # We need two completed candles: candidate (i-2) and follow-up (i-1). So use i-2 as last completed.
     if current_ms < last_start + period_ms:
-        row = df.iloc[-2]  # last closed candle
+        row = df.iloc[-2]   # last completed candle
         candle_time = int(df["time"].iloc[-2])
     else:
-        row = df.iloc[-1]  # last candle already closed
+        row = df.iloc[-1]
         candle_time = int(df["time"].iloc[-1])
 
     if last_evaluated_time == candle_time:
@@ -461,19 +539,41 @@ def check_and_alert():
     if row["bear_reversal_candidate"]:
         messages.append(build_reversal_tooltip(row, "BEAR_REVERSAL", TIMEFRAME, candle_time))
 
+    # Confirmed / Failed Reversals
+    if row["bull_confirmed"]:
+        messages.append(build_reversal_tooltip(row, "CONFIRMED_BULL", TIMEFRAME, candle_time))
+    if row["bear_confirmed"]:
+        messages.append(build_reversal_tooltip(row, "CONFIRMED_BEAR", TIMEFRAME, candle_time))
+    if row["bull_failed"]:
+        messages.append(build_reversal_tooltip(row, "BULL_FAILED", TIMEFRAME, candle_time))
+    if row["bear_failed"]:
+        messages.append(build_reversal_tooltip(row, "BEAR_FAILED", TIMEFRAME, candle_time))
+
     # Money flow signals
     if row["new_buyers_raw"]:
         messages.append(build_moneyflow_tooltip(row, "NEW_BUYERS", TIMEFRAME, candle_time))
     if row["new_sellers_raw"]:
         messages.append(build_moneyflow_tooltip(row, "NEW_SELLERS", TIMEFRAME, candle_time))
-    if row["buyers_exiting_raw"]:
+    if row["buyers_exiting_raw"]:   # => SELLER EXIT
         messages.append(build_moneyflow_tooltip(row, "SELLER_EXIT", TIMEFRAME, candle_time))
-    if row["sellers_exiting_raw"]:
+    if row["sellers_exiting_raw"]:  # => BUYER EXIT
         messages.append(build_moneyflow_tooltip(row, "BUYER_EXIT", TIMEFRAME, candle_time))
     if row["bull_shift_raw"]:
         messages.append(build_moneyflow_tooltip(row, "BULLISH_FLOW", TIMEFRAME, candle_time))
     if row["bear_shift_raw"]:
         messages.append(build_moneyflow_tooltip(row, "BEARISH_FLOW", TIMEFRAME, candle_time))
+
+    # OI Divergence
+    if row["bullish_divergence"]:
+        messages.append(build_moneyflow_tooltip(row, "BULLISH_DIVERGENCE", TIMEFRAME, candle_time))
+    if row["bearish_divergence"]:
+        messages.append(build_moneyflow_tooltip(row, "BEARISH_DIVERGENCE", TIMEFRAME, candle_time))
+
+    # Trapped signals
+    if row["trapped_buyers_raw"]:
+        messages.append(build_moneyflow_tooltip(row, "TRAPPED_BUYERS", TIMEFRAME, candle_time))
+    if row["trapped_sellers_raw"]:
+        messages.append(build_moneyflow_tooltip(row, "TRAPPED_SELLERS", TIMEFRAME, candle_time))
 
     for msg in messages:
         try:
