@@ -11,17 +11,16 @@ import sys
 sys.stdout.reconfigure(line_buffering=True)
 
 # ============ CONFIGURATION ============
-TELEGRAM_TOKEN = "8776819788:AAHfoFM_82byoGtR3q6jB0PKHw5S45GBqJI"          # <-- new bot token from BotFather
-CHAT_ID = "-1003988993524"                 # <-- your channel chat ID
+TELEGRAM_TOKEN = "8776819788:AAHfoFM_82byoGtR3q6jB0PKHw5S45GBqJI"          # <-- আপনার নতুন bot token
+CHAT_ID = "-1003988993524"                 # আপনার channel chat ID
 
-SYMBOL = "BTCUSDT"          # Binance Futures perpetual symbol
+SYMBOL = "BTCUSDT"                         # Bybit linear symbol
 TIMEFRAME = "15m"
 LOWER_TF = "1m"
-LIMIT = 100
+LIMIT = 300
 VOLUME_LOOKBACK = 50
 OI_LOOKBACK = 42
 
-# Reversal data inputs
 REVERSAL_IMPULSE_LOOKBACK = 12
 REVERSAL_MIN_IMPULSE = 1000.0
 REVERSAL_SWING_LOOKBACK = 8
@@ -30,7 +29,6 @@ REVERSAL_DELTA_SHARE_THRESHOLD = 0.25
 REVERSAL_OI_MULTIPLIER = 1.0
 REVERSAL_MINIMUM_SCORE = 4
 
-# Money flow thresholds (from Pine Script)
 DEEP_BLUE_VOLUME_MULT = 3.0
 DEEP_BLUE_DELTA_SHARE = 0.35
 OI_ENTRY_MULT = 1.5
@@ -38,76 +36,108 @@ OI_EXIT_MULT = 1.0
 OI_BUILD_MIN_ABS_15M = 110.0
 OI_EXIT_MIN_ABS_15M = 120.0
 
-# ============ BINANCE FUTURES API ============
-def get_binance_futures_klines(symbol, interval, limit):
-    """Binance Futures klines (candles) with debug"""
-    url = "https://fapi.binance.com/fapi/v1/klines"
+# ============ BYBIT INTERVAL HELPERS ============
+def to_bybit_kline_interval(tf):
+    """'15m' -> '15', '1m' -> '1', '1H' -> '60'"""
+    if tf.endswith("m"):
+        return tf[:-1]
+    if tf.endswith("H") or tf.endswith("h"):
+        return str(int(tf[:-1]) * 60)
+    if tf.endswith("D") or tf.endswith("d"):
+        return "D"
+    return tf
+
+def to_bybit_oi_interval(tf):
+    """'15m' -> '15min', '1h' -> '1h', '1d' -> '1d'"""
+    if tf.endswith("m"):
+        return tf[:-1] + "min"
+    if tf.endswith("H") or tf.endswith("h"):
+        return tf[:-1] + "h"
+    if tf.endswith("D") or tf.endswith("d"):
+        return tf[:-1] + "d"
+    return tf
+
+# ============ BYBIT FUTURES API ============
+def get_market_klines(instId, bar, limit):
+    """Bybit Futures klines"""
+    url = "https://api.bybit.com/v5/market/kline"
+    interval = to_bybit_kline_interval(bar)
     params = {
-        "symbol": symbol,
+        "category": "linear",
+        "symbol": instId,
         "interval": interval,
         "limit": limit
     }
     try:
         resp = requests.get(url, params=params, timeout=10)
-        print(f"Binance klines status: {resp.status_code}")
-        if resp.status_code != 200:
-            print(f"Binance response: {resp.text[:300]}")
-            return None
-        
+        print(f"Bybit klines status: {resp.status_code}")
         data = resp.json()
-        if not isinstance(data, list) or len(data) == 0:
+        if resp.status_code != 200:
+            print(f"Bybit response: {str(data)[:300]}")
+            return None
+
+        result = data.get("result", {})
+        rows = result.get("list", [])
+        if not isinstance(rows, list) or len(rows) == 0:
             print(f"Unexpected data: {str(data)[:300]}")
             return None
-        
-        df = pd.DataFrame(data, columns=[
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "quote_volume", "trades", "taker_base",
-            "taker_quote", "ignore"
-        ])
-        for col in ["open", "high", "low", "close", "volume"]:
+
+        df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "vol", "turnover"])
+        for col in ["open", "high", "low", "close", "vol"]:
             df[col] = df[col].astype(float)
-        df = df.reset_index(drop=True)
-        df.rename(columns={"volume": "vol"}, inplace=True)
+        df["time"] = df["time"].astype(int)
+        df = df.sort_values("time").reset_index(drop=True)
         return df
     except Exception as e:
-        print(f"Error fetching Binance klines: {e}")
+        print(f"Error fetching Bybit klines: {e}")
         return None
 
-def get_binance_oi_history(symbol, period, limit):
-    """Binance Futures Open Interest history"""
-    url = "https://fapi.binance.com/futures/data/openInterestHist"
+def get_oi_history(bar, limit):
+    """Bybit Open Interest history"""
+    url = "https://api.bybit.com/v5/market/open-interest"
+    interval_time = to_bybit_oi_interval(bar)
     params = {
-        "symbol": symbol,
-        "period": period,
+        "category": "linear",
+        "symbol": SYMBOL,
+        "intervalTime": interval_time,
         "limit": limit
     }
-    resp = requests.get(url, params=params)
-    data = resp.json()
-    records = []
-    if isinstance(data, list):
-        for item in data:
-            ts = int(item.get("timestamp"))
-            # Use sumOpenInterest (contracts) for OI
-            oi = float(item.get("sumOpenInterest"))
-            records.append({"time": ts, "oi": oi})
-    return records
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        data = resp.json()
+        records = []
+        if resp.status_code == 200:
+            result = data.get("result", {})
+            rows = result.get("list", [])
+            for item in rows:
+                # item format: [openInterest, timestamp]
+                if isinstance(item, list) and len(item) >= 2:
+                    ts = int(item[1])
+                    oi = float(item[0])
+                    records.append({"time": ts, "oi": oi})
+        else:
+            print(f"Bybit OI status: {resp.status_code}, response: {str(data)[:300]}")
+        # sort by time ascending
+        records = sorted(records, key=lambda x: x["time"])
+        return records
+    except Exception as e:
+        print(f"Error fetching Bybit OI: {e}")
+        return []
 
-# ============ DELTA CALCULATION (Binance Futures lower TF) ============
+# ============ DELTA CALCULATION ============
 def calculate_delta(df_main):
-    lower_df = get_binance_futures_klines(SYMBOL, LOWER_TF, 500)
+    lower_df = get_market_klines(SYMBOL, LOWER_TF, 1000)
     if lower_df is None:
-        # fallback: use candle direction
+        # fallback
         df_main["buy_volume"] = df_main.apply(lambda r: r["vol"] if r["close"] > r["open"] else r["vol"]*0.5 if r["close"]==r["open"] else 0, axis=1)
         df_main["sell_volume"] = df_main.apply(lambda r: r["vol"] if r["close"] < r["open"] else r["vol"]*0.5 if r["close"]==r["open"] else 0, axis=1)
         df_main["delta"] = df_main["buy_volume"] - df_main["sell_volume"]
         df_main["delta_share"] = abs(df_main["delta"]) / df_main["vol"].clip(lower=1)
         return df_main
 
-    # Convert timestamps to datetime
-    lower_df["dt"] = pd.to_datetime(lower_df["open_time"].astype(int), unit="ms")
-    df_main["dt"] = pd.to_datetime(df_main["open_time"].astype(int), unit="ms")
+    lower_df["dt"] = pd.to_datetime(lower_df["time"], unit="ms")
+    df_main["dt"] = pd.to_datetime(df_main["time"], unit="ms")
 
-    # Determine duration of main timeframe
     if "H" in TIMEFRAME or "h" in TIMEFRAME:
         main_duration = timedelta(hours=int(TIMEFRAME.replace("H","").replace("h","")))
     elif "D" in TIMEFRAME or "d" in TIMEFRAME:
@@ -122,7 +152,6 @@ def calculate_delta(df_main):
         sub = lower_df[(lower_df["dt"] >= start) & (lower_df["dt"] < end)]
         buy = sub[sub["close"] > sub["open"]]["vol"].sum()
         sell = sub[sub["close"] < sub["open"]]["vol"].sum()
-        # doji volume split
         doji = sub[sub["close"] == sub["open"]]["vol"].sum() * 0.5
         buy += doji
         sell += doji
@@ -137,20 +166,17 @@ def calculate_delta(df_main):
 
 # ============ SIGNAL CALCULATION ============
 def calculate_signals(df):
-    # OI history
-    oi_records = get_binance_oi_history(SYMBOL, TIMEFRAME, LIMIT)
+    oi_records = get_oi_history(TIMEFRAME, LIMIT)
     oi_map = {rec["time"]: rec["oi"] for rec in oi_records}
-    df["time_ms"] = df["open_time"].astype(int)
+    df["time_ms"] = df["time"]
     df["oi"] = df["time_ms"].map(oi_map)
     df["oi_delta"] = df["oi"].diff()
     df["oi_abs_base"] = df["oi_delta"].abs().rolling(OI_LOOKBACK).mean()
     df["oi_decrease"] = df["oi_delta"] < 0
     df["oi_increase"] = df["oi_delta"] > 0
 
-    # Volume base
     df["volume_base"] = df["vol"].rolling(VOLUME_LOOKBACK).mean()
 
-    # Reversal data
     df["prior_high"] = df["high"].shift(1).rolling(REVERSAL_SWING_LOOKBACK).max()
     df["prior_low"] = df["low"].shift(1).rolling(REVERSAL_SWING_LOOKBACK).min()
     df["impulse_high"] = df["high"].shift(1).rolling(REVERSAL_IMPULSE_LOOKBACK).max()
@@ -197,7 +223,6 @@ def calculate_signals(df):
     df["candle_up"] = df["close"] > df["open"]
     df["candle_down"] = df["close"] < df["open"]
 
-    # Short cover / Long liquidation
     df["short_cover"] = (
         df["candle_up"] &
         (df["delta"] > 0) &
@@ -226,21 +251,27 @@ def calculate_signals(df):
         df["volume_pass"].astype(int)
     )
 
-    # ============ MONEY FLOW SIGNALS ============
     df["oi_entry_move_ok"] = (df["oi_delta"].abs() >= df["oi_abs_base"] * OI_ENTRY_MULT) & (df["oi_delta"].abs() >= OI_BUILD_MIN_ABS_15M)
     df["oi_exit_move_ok"] = (df["oi_delta"].abs() >= df["oi_abs_base"] * OI_EXIT_MULT) & (df["oi_delta"].abs() >= OI_EXIT_MIN_ABS_15M)
 
-    # New buyers / new sellers
     df["new_buyers_raw"] = df["oi_entry_move_ok"] & df["oi_increase"] & df["candle_up"]
     df["new_sellers_raw"] = df["oi_entry_move_ok"] & df["oi_increase"] & df["candle_down"]
 
-    # Buyers exiting / sellers exiting (inverted labels per user)
     df["buyers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_down"]
     df["sellers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_up"]
 
-    # Bull/bear shift (deep blue)
-    df["bull_shift_raw"] = (df["vol"] >= df["volume_base"] * DEEP_BLUE_VOLUME_MULT) & (df["delta_share"] >= DEEP_BLUE_DELTA_SHARE) & (df["delta"] > 0) & df["candle_up"]
-    df["bear_shift_raw"] = (df["vol"] >= df["volume_base"] * DEEP_BLUE_VOLUME_MULT) & (df["delta_share"] >= DEEP_BLUE_DELTA_SHARE) & (df["delta"] < 0) & df["candle_down"]
+    df["bull_shift_raw"] = (
+        (df["vol"] >= df["volume_base"] * DEEP_BLUE_VOLUME_MULT) &
+        (df["delta_share"] >= DEEP_BLUE_DELTA_SHARE) &
+        (df["delta"] > 0) &
+        df["candle_up"]
+    )
+    df["bear_shift_raw"] = (
+        (df["vol"] >= df["volume_base"] * DEEP_BLUE_VOLUME_MULT) &
+        (df["delta_share"] >= DEEP_BLUE_DELTA_SHARE) &
+        (df["delta"] < 0) &
+        df["candle_down"]
+    )
 
     return df
 
@@ -269,7 +300,6 @@ def format_delta(d):
         return f"{sign}{d:.0f}"
 
 def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
-    # determine title, detail, etc.
     if signal_type == "SHORT_COVER":
         title = f"SHORT COVER [{strength_text(row['short_cover_score'], 4)}]"
         detail = "Shorts buying back"
@@ -332,11 +362,11 @@ def build_moneyflow_tooltip(row, signal_type, timeframe, candle_time):
         title = "🔴 NEW SELLERS ENTRY"
         detail = f"OI Change: {format_delta(row['oi_delta'])}"
         extra = f"Price: {row['close']:.1f}"
-    elif signal_type == "SELLER_EXIT":   # derived from buyers_exiting_raw
+    elif signal_type == "SELLER_EXIT":
         title = "⚫ SELLER EXIT"
         detail = f"OI Change: {format_delta(row['oi_delta'])}"
         extra = f"Price: {row['close']:.1f}"
-    elif signal_type == "BUYER_EXIT":    # derived from sellers_exiting_raw
+    elif signal_type == "BUYER_EXIT":
         title = "⚫ BUYER EXIT"
         detail = f"OI Change: {format_delta(row['oi_delta'])}"
         extra = f"Price: {row['close']:.1f}"
@@ -368,7 +398,7 @@ def check_and_alert():
     global last_evaluated_time
     print(f"[{datetime.now()}] Checking signals...")
 
-    df = get_binance_futures_klines(SYMBOL, TIMEFRAME, LIMIT)
+    df = get_market_klines(SYMBOL, TIMEFRAME, LIMIT)
     if df is None:
         print("❌ Failed to fetch candles")
         return
@@ -379,26 +409,24 @@ def check_and_alert():
     if len(df) < 2:
         return
 
-    # Determine which candle to evaluate (last completed)
     period_ms = (
         int(pd.Timedelta(TIMEFRAME).total_seconds() * 1000)
         if "m" in TIMEFRAME or "H" in TIMEFRAME or "h" in TIMEFRAME
         else 86400000
     )
     current_ms = int(time.time() * 1000)
-    last_start = int(df["open_time"].iloc[-1])
+    last_start = int(df["time"].iloc[-1])
 
     if current_ms < last_start + period_ms:
-        row = df.iloc[-2]  # last closed candle
-        candle_time = int(df["open_time"].iloc[-2])
+        row = df.iloc[-2]
+        candle_time = int(df["time"].iloc[-2])
     else:
-        row = df.iloc[-1]  # last candle already closed
-        candle_time = int(df["open_time"].iloc[-1])
+        row = df.iloc[-1]
+        candle_time = int(df["time"].iloc[-1])
 
     if last_evaluated_time == candle_time:
-        return  # already processed this candle
+        return
 
-    # Collect signals
     messages = []
 
     # Reversal signals
@@ -417,19 +445,18 @@ def check_and_alert():
     if row["new_sellers_raw"]:
         messages.append(build_moneyflow_tooltip(row, "NEW_SELLERS", TIMEFRAME, candle_time))
     if row["buyers_exiting_raw"]:
-        messages.append(build_moneyflow_tooltip(row, "SELLER_EXIT", TIMEFRAME, candle_time))  # inverted label
+        messages.append(build_moneyflow_tooltip(row, "SELLER_EXIT", TIMEFRAME, candle_time))
     if row["sellers_exiting_raw"]:
-        messages.append(build_moneyflow_tooltip(row, "BUYER_EXIT", TIMEFRAME, candle_time))   # inverted label
+        messages.append(build_moneyflow_tooltip(row, "BUYER_EXIT", TIMEFRAME, candle_time))
     if row["bull_shift_raw"]:
         messages.append(build_moneyflow_tooltip(row, "BULLISH_FLOW", TIMEFRAME, candle_time))
     if row["bear_shift_raw"]:
         messages.append(build_moneyflow_tooltip(row, "BEARISH_FLOW", TIMEFRAME, candle_time))
 
-    # Send all messages
     for msg in messages:
         try:
             send_telegram_sync(msg)
-            print(f"✅ Sent signal to Telegram")
+            print("✅ Sent signal to Telegram")
         except Exception as e:
             print(f"❌ Telegram send error: {e}")
 
@@ -448,7 +475,7 @@ def home():
 @app.route("/test")
 def test():
     try:
-        send_telegram_sync(f"🕐 {TIMEFRAME} | Test message from Render (Binance Futures)")
+        send_telegram_sync(f"🕐 {TIMEFRAME} | Test message from Render (Bybit Futures)")
         return "Test message sent"
     except Exception as e:
         return f"Error: {e}"
