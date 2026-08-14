@@ -300,8 +300,11 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(1)
 
+# Scheduler কে background thread-এ চালু করুন
+import threading
+threading.Thread(target=run_scheduler, daemon=True).start()
+
+# Flask app চালানোর জন্য (Render-এ Gunicorn ব্যবহার হয়)
 if __name__ == "__main__":
-    import threading
-    threading.Thread(target=run_scheduler, daemon=True).start()
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
