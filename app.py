@@ -9,16 +9,17 @@ from flask import Flask
 from telegram import Bot
 
 # ============ CONFIGURATION ============
-TELEGRAM_TOKEN = "8776819788:AAHfoFM_82byoGtR3q6jB0PKHw5S45GBqJI"
-CHAT_ID = "-1003988993524"
+TELEGRAM_TOKEN = "8776819788:AAHfoFM_82byoGtR3q6jB0PKHw5S45GBqJI"          # <-- new bot token from BotFather
+CHAT_ID = "-1003988993524"                 # <-- your channel chat ID
 
-SYMBOL = "BTC-USDT-SWAP"
+SYMBOL = "BTCUSDT"          # Binance Futures perpetual symbol
 TIMEFRAME = "15m"
 LOWER_TF = "1m"
 LIMIT = 100
 VOLUME_LOOKBACK = 50
 OI_LOOKBACK = 42
 
+# Reversal data inputs
 REVERSAL_IMPULSE_LOOKBACK = 12
 REVERSAL_MIN_IMPULSE = 1000.0
 REVERSAL_SWING_LOOKBACK = 8
@@ -27,51 +28,76 @@ REVERSAL_DELTA_SHARE_THRESHOLD = 0.25
 REVERSAL_OI_MULTIPLIER = 1.0
 REVERSAL_MINIMUM_SCORE = 4
 
-# ============ OKX API ============
-def get_okx_klines(instId, bar, limit):
-    url = "https://www.okx.com/api/v5/market/candles"
-    params = {"instId": instId, "bar": bar, "limit": str(limit)}
+# Money flow thresholds (from Pine Script)
+DEEP_BLUE_VOLUME_MULT = 3.0
+DEEP_BLUE_DELTA_SHARE = 0.35
+OI_ENTRY_MULT = 1.5
+OI_EXIT_MULT = 1.0
+OI_BUILD_MIN_ABS_15M = 110.0
+OI_EXIT_MIN_ABS_15M = 120.0
+
+# ============ BINANCE FUTURES API ============
+def get_binance_futures_klines(symbol, interval, limit):
+    """Binance Futures klines (candles)"""
+    url = "https://fapi.binance.com/fapi/v1/klines"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }
     resp = requests.get(url, params=params)
     data = resp.json()
-    if data["code"] == "0":
-        df = pd.DataFrame(data["data"], columns=["time", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"])
-        for col in ["open", "high", "low", "close", "vol"]:
+    if isinstance(data, list) and len(data) > 0:
+        df = pd.DataFrame(data, columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "trades", "taker_base",
+            "taker_quote", "ignore"
+        ])
+        for col in ["open", "high", "low", "close", "volume"]:
             df[col] = df[col].astype(float)
-        df = df.iloc[::-1].reset_index(drop=True)
+        # Binance open_time is in ms, already chronological ascending
+        df = df.reset_index(drop=True)
+        # Rename volume to vol for consistency
+        df.rename(columns={"volume": "vol"}, inplace=True)
         return df
-    return None
+    else:
+        return None
 
-def get_okx_oi_history(bar, limit):
-    url = "https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-history"
-    params = {"instId": SYMBOL, "period": bar, "limit": str(limit)}
+def get_binance_oi_history(symbol, period, limit):
+    """Binance Futures Open Interest history"""
+    url = "https://fapi.binance.com/futures/data/openInterestHist"
+    params = {
+        "symbol": symbol,
+        "period": period,
+        "limit": limit
+    }
     resp = requests.get(url, params=params)
     data = resp.json()
     records = []
-    if data.get("code") == "0":
-        for item in data["data"]:
-            if isinstance(item, dict):
-                ts = int(item.get("ts") or item.get("time"))
-                oi = float(item.get("oi") or item.get("openInterest"))
-            elif isinstance(item, list):
-                ts = int(item[0])
-                oi = float(item[1])
-            else:
-                continue
+    if isinstance(data, list):
+        for item in data:
+            ts = int(item.get("timestamp"))
+            # Use sumOpenInterest (contracts) for OI
+            oi = float(item.get("sumOpenInterest"))
             records.append({"time": ts, "oi": oi})
     return records
 
+# ============ DELTA CALCULATION (Binance Futures lower TF) ============
 def calculate_delta(df_main):
-    lower_df = get_okx_klines(SYMBOL, LOWER_TF, 500)
+    lower_df = get_binance_futures_klines(SYMBOL, LOWER_TF, 500)
     if lower_df is None:
+        # fallback: use candle direction
         df_main["buy_volume"] = df_main.apply(lambda r: r["vol"] if r["close"] > r["open"] else r["vol"]*0.5 if r["close"]==r["open"] else 0, axis=1)
         df_main["sell_volume"] = df_main.apply(lambda r: r["vol"] if r["close"] < r["open"] else r["vol"]*0.5 if r["close"]==r["open"] else 0, axis=1)
         df_main["delta"] = df_main["buy_volume"] - df_main["sell_volume"]
         df_main["delta_share"] = abs(df_main["delta"]) / df_main["vol"].clip(lower=1)
         return df_main
 
-    lower_df["dt"] = pd.to_datetime(lower_df["time"].astype(int), unit="ms")
-    df_main["dt"] = pd.to_datetime(df_main["time"].astype(int), unit="ms")
+    # Convert timestamps to datetime
+    lower_df["dt"] = pd.to_datetime(lower_df["open_time"].astype(int), unit="ms")
+    df_main["dt"] = pd.to_datetime(df_main["open_time"].astype(int), unit="ms")
 
+    # Determine duration of main timeframe
     if "H" in TIMEFRAME or "h" in TIMEFRAME:
         main_duration = timedelta(hours=int(TIMEFRAME.replace("H","").replace("h","")))
     elif "D" in TIMEFRAME or "d" in TIMEFRAME:
@@ -86,6 +112,7 @@ def calculate_delta(df_main):
         sub = lower_df[(lower_df["dt"] >= start) & (lower_df["dt"] < end)]
         buy = sub[sub["close"] > sub["open"]]["vol"].sum()
         sell = sub[sub["close"] < sub["open"]]["vol"].sum()
+        # doji volume split
         doji = sub[sub["close"] == sub["open"]]["vol"].sum() * 0.5
         buy += doji
         sell += doji
@@ -98,16 +125,22 @@ def calculate_delta(df_main):
     df_main["delta_share"] = abs(df_main["delta"]) / df_main["vol"].clip(lower=1)
     return df_main
 
-def calculate_reversal_signals(df):
-    oi_records = get_okx_oi_history(TIMEFRAME, LIMIT)
+# ============ SIGNAL CALCULATION ============
+def calculate_signals(df):
+    # OI history
+    oi_records = get_binance_oi_history(SYMBOL, TIMEFRAME, LIMIT)
     oi_map = {rec["time"]: rec["oi"] for rec in oi_records}
-    df["time_ms"] = df["time"].astype(int)
+    df["time_ms"] = df["open_time"].astype(int)
     df["oi"] = df["time_ms"].map(oi_map)
     df["oi_delta"] = df["oi"].diff()
     df["oi_abs_base"] = df["oi_delta"].abs().rolling(OI_LOOKBACK).mean()
     df["oi_decrease"] = df["oi_delta"] < 0
+    df["oi_increase"] = df["oi_delta"] > 0
 
+    # Volume base
     df["volume_base"] = df["vol"].rolling(VOLUME_LOOKBACK).mean()
+
+    # Reversal data
     df["prior_high"] = df["high"].shift(1).rolling(REVERSAL_SWING_LOOKBACK).max()
     df["prior_low"] = df["low"].shift(1).rolling(REVERSAL_SWING_LOOKBACK).min()
     df["impulse_high"] = df["high"].shift(1).rolling(REVERSAL_IMPULSE_LOOKBACK).max()
@@ -148,11 +181,13 @@ def calculate_reversal_signals(df):
         (df["oi_pass"] & df["oi_decrease"]).astype(int)
     )
 
-    df["bull_candidate"] = df["bull_sweep"] & df["bull_reject"] & (df["bull_score"] >= REVERSAL_MINIMUM_SCORE)
-    df["bear_candidate"] = df["bear_sweep"] & df["bear_reject"] & (df["bear_score"] >= REVERSAL_MINIMUM_SCORE)
+    df["bull_reversal_candidate"] = df["bull_sweep"] & df["bull_reject"] & (df["bull_score"] >= REVERSAL_MINIMUM_SCORE)
+    df["bear_reversal_candidate"] = df["bear_sweep"] & df["bear_reject"] & (df["bear_score"] >= REVERSAL_MINIMUM_SCORE)
 
     df["candle_up"] = df["close"] > df["open"]
     df["candle_down"] = df["close"] < df["open"]
+
+    # Short cover / Long liquidation
     df["short_cover"] = (
         df["candle_up"] &
         (df["delta"] > 0) &
@@ -180,12 +215,51 @@ def calculate_reversal_signals(df):
         (df["oi_pass"] & df["oi_decrease"]).astype(int) +
         df["volume_pass"].astype(int)
     )
+
+    # ============ MONEY FLOW SIGNALS ============
+    df["oi_entry_move_ok"] = (df["oi_delta"].abs() >= df["oi_abs_base"] * OI_ENTRY_MULT) & (df["oi_delta"].abs() >= OI_BUILD_MIN_ABS_15M)
+    df["oi_exit_move_ok"] = (df["oi_delta"].abs() >= df["oi_abs_base"] * OI_EXIT_MULT) & (df["oi_delta"].abs() >= OI_EXIT_MIN_ABS_15M)
+
+    # New buyers / new sellers
+    df["new_buyers_raw"] = df["oi_entry_move_ok"] & df["oi_increase"] & df["candle_up"]
+    df["new_sellers_raw"] = df["oi_entry_move_ok"] & df["oi_increase"] & df["candle_down"]
+
+    # Buyers exiting / sellers exiting (inverted labels per user)
+    df["buyers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_down"]
+    df["sellers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_up"]
+
+    # Bull/bear shift (deep blue)
+    df["bull_shift_raw"] = (df["vol"] >= df["volume_base"] * DEEP_BLUE_VOLUME_MULT) & (df["delta_share"] >= DEEP_BLUE_DELTA_SHARE) & (df["delta"] > 0) & df["candle_up"]
+    df["bear_shift_raw"] = (df["vol"] >= df["volume_base"] * DEEP_BLUE_VOLUME_MULT) & (df["delta_share"] >= DEEP_BLUE_DELTA_SHARE) & (df["delta"] < 0) & df["candle_down"]
+
     return df
 
+# ============ MESSAGE BUILDERS ============
 def strength_text(score, max_score):
     return "Strong" if score >= max_score - 1 else "Medium" if score >= max_score - 2 else "Watch"
 
-def build_tooltip(row, signal_type):
+def format_volume(v):
+    if pd.isna(v):
+        return "n/a"
+    v = abs(v)
+    if v >= 1_000_000:
+        return f"{v/1_000_000:.2f}M"
+    elif v >= 1_000:
+        return f"{v/1_000:.2f}K"
+    else:
+        return f"{v:.0f}"
+
+def format_delta(d):
+    if pd.isna(d):
+        return "n/a"
+    sign = "+" if d > 0 else "-" if d < 0 else ""
+    if abs(d) >= 1000:
+        return f"{sign}{format_volume(abs(d))}"
+    else:
+        return f"{sign}{d:.0f}"
+
+def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
+    # determine title, detail, etc.
     if signal_type == "SHORT_COVER":
         title = f"SHORT COVER [{strength_text(row['short_cover_score'], 4)}]"
         detail = "Shorts buying back"
@@ -221,7 +295,11 @@ def build_tooltip(row, signal_type):
     else:
         return ""
 
+    time_str = datetime.fromtimestamp(candle_time / 1000).strftime("%Y-%m-%d %H:%M:%S") if candle_time else datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    header = f"🕐 {timeframe} | {time_str}\n"
+
     return (
+        header +
         f"{title}\n"
         f"{detail}\n"
         f"Bias: {bias} · Score: {score}\n"
@@ -229,9 +307,43 @@ def build_tooltip(row, signal_type):
         f"❌ Wrong if close {invalid}\n"
         f"Next: {next_text}\n"
         f"{level}\n"
-        f"V {row['vol']:.0f} · Δ {row['delta']:.0f} · OI {row['oi_delta']:.0f}"
+        f"V {format_volume(row['vol'])} · Δ {format_delta(row['delta'])} · OI {format_delta(row['oi_delta'])}"
     )
 
+def build_moneyflow_tooltip(row, signal_type, timeframe, candle_time):
+    time_str = datetime.fromtimestamp(candle_time / 1000).strftime("%Y-%m-%d %H:%M:%S") if candle_time else datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    header = f"🕐 {timeframe} | {time_str}\n"
+
+    if signal_type == "NEW_BUYERS":
+        title = "🟢 NEW BUYERS ENTRY"
+        detail = f"OI Change: {format_delta(row['oi_delta'])}"
+        extra = f"Price: {row['close']:.1f}"
+    elif signal_type == "NEW_SELLERS":
+        title = "🔴 NEW SELLERS ENTRY"
+        detail = f"OI Change: {format_delta(row['oi_delta'])}"
+        extra = f"Price: {row['close']:.1f}"
+    elif signal_type == "SELLER_EXIT":   # derived from buyers_exiting_raw
+        title = "⚫ SELLER EXIT"
+        detail = f"OI Change: {format_delta(row['oi_delta'])}"
+        extra = f"Price: {row['close']:.1f}"
+    elif signal_type == "BUYER_EXIT":    # derived from sellers_exiting_raw
+        title = "⚫ BUYER EXIT"
+        detail = f"OI Change: {format_delta(row['oi_delta'])}"
+        extra = f"Price: {row['close']:.1f}"
+    elif signal_type == "BULLISH_FLOW":
+        title = "🟢 BULLISH MONEY FLOW"
+        detail = f"Delta: {format_delta(row['delta'])}"
+        extra = f"Volume: {format_volume(row['vol'])}"
+    elif signal_type == "BEARISH_FLOW":
+        title = "🔴 BEARISH MONEY FLOW"
+        detail = f"Delta: {format_delta(row['delta'])}"
+        extra = f"Volume: {format_volume(row['vol'])}"
+    else:
+        return ""
+
+    return header + f"{title}\n{detail}\n{extra}\n"
+
+# ============ TELEGRAM SENDER ============
 def send_telegram_sync(text):
     bot = Bot(token=TELEGRAM_TOKEN)
     loop = asyncio.new_event_loop()
@@ -239,60 +351,97 @@ def send_telegram_sync(text):
     loop.run_until_complete(bot.send_message(chat_id=CHAT_ID, text=text))
     loop.close()
 
+# ============ MAIN CHECK ============
 last_evaluated_time = None
 
 def check_and_alert():
     global last_evaluated_time
-    df = get_okx_klines(SYMBOL, TIMEFRAME, LIMIT)
+    print(f"[{datetime.now()}] Checking signals...")
+
+    df = get_binance_futures_klines(SYMBOL, TIMEFRAME, LIMIT)
     if df is None:
+        print("❌ Failed to fetch candles")
         return
 
     df = calculate_delta(df)
-    df = calculate_reversal_signals(df)
+    df = calculate_signals(df)
 
     if len(df) < 2:
         return
 
+    # Determine which candle to evaluate (last completed)
     period_ms = (
         int(pd.Timedelta(TIMEFRAME).total_seconds() * 1000)
         if "m" in TIMEFRAME or "H" in TIMEFRAME or "h" in TIMEFRAME
         else 86400000
     )
     current_ms = int(time.time() * 1000)
-    last_start = int(df["time"].iloc[-1])
+    last_start = int(df["open_time"].iloc[-1])
 
     if current_ms < last_start + period_ms:
-        row = df.iloc[-2]
-        candle_time = int(df["time"].iloc[-2])
+        row = df.iloc[-2]  # last closed candle
+        candle_time = int(df["open_time"].iloc[-2])
     else:
-        row = df.iloc[-1]
-        candle_time = int(df["time"].iloc[-1])
+        row = df.iloc[-1]  # last candle already closed
+        candle_time = int(df["open_time"].iloc[-1])
 
     if last_evaluated_time == candle_time:
-        return
+        return  # already processed this candle
 
-    signal_sent = False
+    # Collect signals
+    messages = []
+
+    # Reversal signals
     if row["short_cover"]:
-        send_telegram_sync(build_tooltip(row, "SHORT_COVER"))
-        signal_sent = True
+        messages.append(build_reversal_tooltip(row, "SHORT_COVER", TIMEFRAME, candle_time))
     if row["long_liq"]:
-        send_telegram_sync(build_tooltip(row, "LONG_LIQ"))
-        signal_sent = True
-    if row["bull_candidate"]:
-        send_telegram_sync(build_tooltip(row, "BULL_REVERSAL"))
-        signal_sent = True
-    if row["bear_candidate"]:
-        send_telegram_sync(build_tooltip(row, "BEAR_REVERSAL"))
-        signal_sent = True
+        messages.append(build_reversal_tooltip(row, "LONG_LIQ", TIMEFRAME, candle_time))
+    if row["bull_reversal_candidate"]:
+        messages.append(build_reversal_tooltip(row, "BULL_REVERSAL", TIMEFRAME, candle_time))
+    if row["bear_reversal_candidate"]:
+        messages.append(build_reversal_tooltip(row, "BEAR_REVERSAL", TIMEFRAME, candle_time))
 
-    if signal_sent:
+    # Money flow signals
+    if row["new_buyers_raw"]:
+        messages.append(build_moneyflow_tooltip(row, "NEW_BUYERS", TIMEFRAME, candle_time))
+    if row["new_sellers_raw"]:
+        messages.append(build_moneyflow_tooltip(row, "NEW_SELLERS", TIMEFRAME, candle_time))
+    if row["buyers_exiting_raw"]:
+        messages.append(build_moneyflow_tooltip(row, "SELLER_EXIT", TIMEFRAME, candle_time))  # inverted label
+    if row["sellers_exiting_raw"]:
+        messages.append(build_moneyflow_tooltip(row, "BUYER_EXIT", TIMEFRAME, candle_time))   # inverted label
+    if row["bull_shift_raw"]:
+        messages.append(build_moneyflow_tooltip(row, "BULLISH_FLOW", TIMEFRAME, candle_time))
+    if row["bear_shift_raw"]:
+        messages.append(build_moneyflow_tooltip(row, "BEARISH_FLOW", TIMEFRAME, candle_time))
+
+    # Send all messages
+    for msg in messages:
+        try:
+            send_telegram_sync(msg)
+            print(f"✅ Sent signal to Telegram")
+        except Exception as e:
+            print(f"❌ Telegram send error: {e}")
+
+    if messages:
         last_evaluated_time = candle_time
+    else:
+        print("No signals on this candle.")
 
+# ============ FLASK APP ============
 app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "Bot is running!"
+
+@app.route("/test")
+def test():
+    try:
+        send_telegram_sync(f"🕐 {TIMEFRAME} | Test message from Render (Binance Futures)")
+        return "Test message sent"
+    except Exception as e:
+        return f"Error: {e}"
 
 def run_scheduler():
     schedule.every(5).minutes.do(check_and_alert)
@@ -300,11 +449,8 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(1)
 
-# Scheduler কে background thread-এ চালু করুন
-import threading
-threading.Thread(target=run_scheduler, daemon=True).start()
-
-# Flask app চালানোর জন্য (Render-এ Gunicorn ব্যবহার হয়)
 if __name__ == "__main__":
+    import threading
+    threading.Thread(target=run_scheduler, daemon=True).start()
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
