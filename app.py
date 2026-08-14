@@ -11,13 +11,14 @@ import sys
 sys.stdout.reconfigure(line_buffering=True)
 
 # ============ CONFIGURATION ============
-TELEGRAM_TOKEN = "8776819788:AAHfoFM_82byoGtR3q6jB0PKHw5S45GBqJI"          # <-- আপনার নতুন bot token
-CHAT_ID = "-1003988993524"                 # আপনার channel chat ID
+TELEGRAM_TOKEN = "8776819788:AAHfoFM_82byoGtR3q6jB0PKHw5S45GBqJI"          # <-- আপনার নতুন Bot Token
+CHAT_ID = "-1003988993524"                 # আপনার Channel Chat ID
 
-SYMBOL = "BTCUSDT"                         # Bybit linear symbol
+SYMBOL = "BTC-USDT-SWAP"
 TIMEFRAME = "15m"
 LOWER_TF = "1m"
-LIMIT = 300
+LIMIT = 300                                # এখন 300 candles
+LOWER_LIMIT = 1000                         # delta-র জন্য 1m candles
 VOLUME_LOOKBACK = 50
 OI_LOOKBACK = 42
 
@@ -36,97 +37,58 @@ OI_EXIT_MULT = 1.0
 OI_BUILD_MIN_ABS_15M = 110.0
 OI_EXIT_MIN_ABS_15M = 120.0
 
-# ============ BYBIT INTERVAL HELPERS ============
-def to_bybit_kline_interval(tf):
-    """'15m' -> '15', '1m' -> '1', '1H' -> '60'"""
-    if tf.endswith("m"):
-        return tf[:-1]
-    if tf.endswith("H") or tf.endswith("h"):
-        return str(int(tf[:-1]) * 60)
-    if tf.endswith("D") or tf.endswith("d"):
-        return "D"
-    return tf
-
-def to_bybit_oi_interval(tf):
-    """'15m' -> '15min', '1h' -> '1h', '1d' -> '1d'"""
-    if tf.endswith("m"):
-        return tf[:-1] + "min"
-    if tf.endswith("H") or tf.endswith("h"):
-        return tf[:-1] + "h"
-    if tf.endswith("D") or tf.endswith("d"):
-        return tf[:-1] + "d"
-    return tf
-
-# ============ BYBIT FUTURES API ============
+# ============ OKX API ============
 def get_market_klines(instId, bar, limit):
-    """Bybit Futures klines"""
-    url = "https://api.bybit.com/v5/market/kline"
-    interval = to_bybit_kline_interval(bar)
-    params = {
-        "category": "linear",
-        "symbol": instId,
-        "interval": interval,
-        "limit": limit
-    }
+    """OKX Futures klines"""
+    url = "https://www.okx.com/api/v5/market/candles"
+    params = {"instId": instId, "bar": bar, "limit": str(limit)}
     try:
         resp = requests.get(url, params=params, timeout=10)
-        print(f"Bybit klines status: {resp.status_code}")
+        print(f"OKX klines status: {resp.status_code}")
         data = resp.json()
-        if resp.status_code != 200:
-            print(f"Bybit response: {str(data)[:300]}")
+        if data.get("code") == "0":
+            df = pd.DataFrame(data["data"], columns=["time", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"])
+            for col in ["open", "high", "low", "close", "vol"]:
+                df[col] = df[col].astype(float)
+            df = df.iloc[::-1].reset_index(drop=True)
+            return df
+        else:
+            print(f"OKX error: {data}")
             return None
-
-        result = data.get("result", {})
-        rows = result.get("list", [])
-        if not isinstance(rows, list) or len(rows) == 0:
-            print(f"Unexpected data: {str(data)[:300]}")
-            return None
-
-        df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "vol", "turnover"])
-        for col in ["open", "high", "low", "close", "vol"]:
-            df[col] = df[col].astype(float)
-        df["time"] = df["time"].astype(int)
-        df = df.sort_values("time").reset_index(drop=True)
-        return df
     except Exception as e:
-        print(f"Error fetching Bybit klines: {e}")
+        print(f"Error fetching OKX klines: {e}")
         return None
 
 def get_oi_history(bar, limit):
-    """Bybit Open Interest history"""
-    url = "https://api.bybit.com/v5/market/open-interest"
-    interval_time = to_bybit_oi_interval(bar)
-    params = {
-        "category": "linear",
-        "symbol": SYMBOL,
-        "intervalTime": interval_time,
-        "limit": limit
-    }
+    """OKX Open Interest history"""
+    url = "https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-history"
+    params = {"instId": SYMBOL, "period": bar, "limit": str(limit)}
     try:
         resp = requests.get(url, params=params, timeout=10)
         data = resp.json()
         records = []
-        if resp.status_code == 200:
-            result = data.get("result", {})
-            rows = result.get("list", [])
-            for item in rows:
-                # item format: [openInterest, timestamp]
-                if isinstance(item, list) and len(item) >= 2:
-                    ts = int(item[1])
-                    oi = float(item[0])
-                    records.append({"time": ts, "oi": oi})
+        if data.get("code") == "0":
+            for item in data["data"]:
+                if isinstance(item, dict):
+                    ts = int(item.get("ts") or item.get("time"))
+                    oi = float(item.get("oi") or item.get("openInterest"))
+                elif isinstance(item, list):
+                    ts = int(item[0])
+                    oi = float(item[1])
+                else:
+                    continue
+                records.append({"time": ts, "oi": oi})
         else:
-            print(f"Bybit OI status: {resp.status_code}, response: {str(data)[:300]}")
-        # sort by time ascending
+            print(f"OKX OI error: {data}")
         records = sorted(records, key=lambda x: x["time"])
         return records
     except Exception as e:
-        print(f"Error fetching Bybit OI: {e}")
+        print(f"Error fetching OKX OI: {e}")
         return []
 
 # ============ DELTA CALCULATION ============
 def calculate_delta(df_main):
-    lower_df = get_market_klines(SYMBOL, LOWER_TF, 1000)
+    lower_df = get_market_klines(SYMBOL, LOWER_TF, LOWER_LIMIT)
     if lower_df is None:
         # fallback
         df_main["buy_volume"] = df_main.apply(lambda r: r["vol"] if r["close"] > r["open"] else r["vol"]*0.5 if r["close"]==r["open"] else 0, axis=1)
@@ -135,8 +97,8 @@ def calculate_delta(df_main):
         df_main["delta_share"] = abs(df_main["delta"]) / df_main["vol"].clip(lower=1)
         return df_main
 
-    lower_df["dt"] = pd.to_datetime(lower_df["time"], unit="ms")
-    df_main["dt"] = pd.to_datetime(df_main["time"], unit="ms")
+    lower_df["dt"] = pd.to_datetime(lower_df["time"].astype(int), unit="ms")
+    df_main["dt"] = pd.to_datetime(df_main["time"].astype(int), unit="ms")
 
     if "H" in TIMEFRAME or "h" in TIMEFRAME:
         main_duration = timedelta(hours=int(TIMEFRAME.replace("H","").replace("h","")))
@@ -164,11 +126,11 @@ def calculate_delta(df_main):
     df_main["delta_share"] = abs(df_main["delta"]) / df_main["vol"].clip(lower=1)
     return df_main
 
-# ============ SIGNAL CALCULATION ============
+# ============ SIGNALS ============
 def calculate_signals(df):
     oi_records = get_oi_history(TIMEFRAME, LIMIT)
     oi_map = {rec["time"]: rec["oi"] for rec in oi_records}
-    df["time_ms"] = df["time"]
+    df["time_ms"] = df["time"].astype(int)
     df["oi"] = df["time_ms"].map(oi_map)
     df["oi_delta"] = df["oi"].diff()
     df["oi_abs_base"] = df["oi_delta"].abs().rolling(OI_LOOKBACK).mean()
@@ -475,7 +437,7 @@ def home():
 @app.route("/test")
 def test():
     try:
-        send_telegram_sync(f"🕐 {TIMEFRAME} | Test message from Render (Bybit Futures)")
+        send_telegram_sync(f"🕐 {TIMEFRAME} | Test message from Render (OKX Futures)")
         return "Test message sent"
     except Exception as e:
         return f"Error: {e}"
