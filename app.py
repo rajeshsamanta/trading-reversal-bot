@@ -5,20 +5,21 @@ import asyncio
 import time
 import schedule
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from flask import Flask
 from telegram import Bot
 import sys
 sys.stdout.reconfigure(line_buffering=True)
 
 # ============ CONFIGURATION ============
-TELEGRAM_TOKEN = "8776819788:AAHfoFM_82byoGtR3q6jB0PKHw5S45GBqJI"          # <-- আপনার নতুন Bot Token
+TELEGRAM_TOKEN = "8776819788:AAHfoFM_82byoGtR3q6jB0PKHw5S45GBqJI"          # <-- আপনার নতুন Bot Token এখানে বসান
 CHAT_ID = "-1003988993524"                 # আপনার Channel Chat ID
 
 SYMBOL = "BTC-USDT-SWAP"
 TIMEFRAME = "15m"
 LOWER_TF = "1m"
-LIMIT = 300                                # এখন 300 candles
-LOWER_LIMIT = 1000                         # delta-র জন্য 1m candles
+LIMIT = 300                                # 300 candles
+LOWER_LIMIT = 1000                         # 1m candles for delta calculation
 VOLUME_LOOKBACK = 50
 OI_LOOKBACK = 42
 
@@ -36,6 +37,14 @@ OI_ENTRY_MULT = 1.5
 OI_EXIT_MULT = 1.0
 OI_BUILD_MIN_ABS_15M = 110.0
 OI_EXIT_MIN_ABS_15M = 120.0
+
+IN_TZ = ZoneInfo("Asia/Kolkata")
+
+def to_indian_time(ms):
+    if ms:
+        return datetime.fromtimestamp(int(ms) / 1000, tz=IN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        return datetime.now(IN_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 # ============ OKX API ============
 def get_market_klines(instId, bar, limit):
@@ -90,7 +99,7 @@ def get_oi_history(bar, limit):
 def calculate_delta(df_main):
     lower_df = get_market_klines(SYMBOL, LOWER_TF, LOWER_LIMIT)
     if lower_df is None:
-        # fallback
+        # fallback: candle direction based approximation
         df_main["buy_volume"] = df_main.apply(lambda r: r["vol"] if r["close"] > r["open"] else r["vol"]*0.5 if r["close"]==r["open"] else 0, axis=1)
         df_main["sell_volume"] = df_main.apply(lambda r: r["vol"] if r["close"] < r["open"] else r["vol"]*0.5 if r["close"]==r["open"] else 0, axis=1)
         df_main["delta"] = df_main["buy_volume"] - df_main["sell_volume"]
@@ -222,6 +231,10 @@ def calculate_signals(df):
     df["buyers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_down"]
     df["sellers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_up"]
 
+    # Trap/force exit conditions
+    df["trapped_buyers_raw"] = df["candle_up"] & df["oi_decrease"] & (df["delta"] < 0)
+    df["trapped_sellers_raw"] = df["candle_down"] & df["oi_decrease"] & (df["delta"] > 0)
+
     df["bull_shift_raw"] = (
         (df["vol"] >= df["volume_base"] * DEEP_BLUE_VOLUME_MULT) &
         (df["delta_share"] >= DEEP_BLUE_DELTA_SHARE) &
@@ -237,7 +250,7 @@ def calculate_signals(df):
 
     return df
 
-# ============ MESSAGE BUILDERS ============
+# ============ FORMAT HELPERS ============
 def strength_text(score, max_score):
     return "Strong" if score >= max_score - 1 else "Medium" if score >= max_score - 2 else "Watch"
 
@@ -261,6 +274,41 @@ def format_delta(d):
     else:
         return f"{sign}{d:.0f}"
 
+def flow_text(row):
+    if row["candle_up"] and row["delta"] < 0:
+        return "Flow: Price up, sellers stronger"
+    elif row["candle_down"] and row["delta"] > 0:
+        return "Flow: Price down, buyers stronger"
+    elif row["delta"] > 0:
+        return "Flow: Buyers stronger"
+    elif row["delta"] < 0:
+        return "Flow: Sellers stronger"
+    else:
+        return "Flow: Neutral"
+
+def net_flow_text(row):
+    if pd.isna(row["delta"]):
+        return "Net: n/a"
+    elif row["delta"] > 0:
+        return f"Net Buyer: {format_volume(row['delta'])}"
+    elif row["delta"] < 0:
+        return f"Net Seller: {format_volume(row['delta'])}"
+    else:
+        return "Net: Neutral"
+
+def trap_exit_text(row):
+    parts = []
+    if row.get("trapped_buyers_raw", False):
+        parts.append("Trap / Force Exit: Buyers trapped")
+    if row.get("trapped_sellers_raw", False):
+        parts.append("Trap / Force Exit: Sellers trapped")
+    if row.get("buyers_exiting_raw", False):
+        parts.append("Exit: Buyers exiting")
+    if row.get("sellers_exiting_raw", False):
+        parts.append("Exit: Sellers exiting")
+    return " | ".join(parts) if parts else "Trap / Force Exit: none"
+
+# ============ REVERSAL TOOLTIP ============
 def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
     if signal_type == "SHORT_COVER":
         title = f"SHORT COVER [{strength_text(row['short_cover_score'], 4)}]"
@@ -270,6 +318,7 @@ def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
         next_text = "UP - next squeeze possible"
         level = f"Squeeze High: {row['prior_high']:.1f}"
         score = f"{int(row['short_cover_score'])}/4"
+        confirm = f"BUY only on close above {row['high']:.1f}"
     elif signal_type == "LONG_LIQ":
         title = f"LONG LIQUIDATION [{strength_text(row['long_liq_score'], 4)}]"
         detail = "Longs liquidating"
@@ -278,6 +327,7 @@ def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
         next_text = "DOWN - continuation risk"
         level = f"Flush Low: {row['prior_low']:.1f}"
         score = f"{int(row['long_liq_score'])}/4"
+        confirm = f"SELL only on close below {row['low']:.1f}"
     elif signal_type == "BULL_REVERSAL":
         title = f"BULL REVERSAL [{strength_text(row['bull_score'], 6)}]"
         detail = "+ TRAPPED SELLERS" if (row['candle_down'] and row['oi_decrease'] and row['delta'] > 0) else "Score-based exhaustion signal"
@@ -286,6 +336,7 @@ def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
         next_text = "UP - follow-through possible"
         level = f"Squeeze High: {row['prior_high']:.1f}"
         score = f"{int(row['bull_score'])}/6"
+        confirm = f"BUY only on close above {row['high']:.1f}"
     elif signal_type == "BEAR_REVERSAL":
         title = f"BEAR REVERSAL [{strength_text(row['bear_score'], 6)}]"
         detail = "+ TRAPPED BUYERS" if (row['candle_up'] and row['oi_decrease'] and row['delta'] < 0) else "Score-based exhaustion signal"
@@ -294,10 +345,11 @@ def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
         next_text = "DOWN - follow-through needed"
         level = f"Flush Low: {row['prior_low']:.1f}"
         score = f"{int(row['bear_score'])}/6"
+        confirm = f"SELL only on close below {row['low']:.1f}"
     else:
         return ""
 
-    time_str = datetime.fromtimestamp(candle_time / 1000).strftime("%Y-%m-%d %H:%M:%S") if candle_time else datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    time_str = to_indian_time(candle_time)
     header = f"🕐 {timeframe} | {time_str}\n"
 
     return (
@@ -309,41 +361,49 @@ def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
         f"❌ Wrong if close {invalid}\n"
         f"Next: {next_text}\n"
         f"{level}\n"
+        f"{confirm}\n"
         f"V {format_volume(row['vol'])} · Δ {format_delta(row['delta'])} · OI {format_delta(row['oi_delta'])}"
     )
 
+# ============ MONEY FLOW TOOLTIP ============
 def build_moneyflow_tooltip(row, signal_type, timeframe, candle_time):
-    time_str = datetime.fromtimestamp(candle_time / 1000).strftime("%Y-%m-%d %H:%M:%S") if candle_time else datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    time_str = to_indian_time(candle_time)
     header = f"🕐 {timeframe} | {time_str}\n"
 
     if signal_type == "NEW_BUYERS":
         title = "🟢 NEW BUYERS ENTRY"
-        detail = f"OI Change: {format_delta(row['oi_delta'])}"
-        extra = f"Price: {row['close']:.1f}"
+        detail = f"Price: {row['close']:.1f}"
     elif signal_type == "NEW_SELLERS":
         title = "🔴 NEW SELLERS ENTRY"
-        detail = f"OI Change: {format_delta(row['oi_delta'])}"
-        extra = f"Price: {row['close']:.1f}"
+        detail = f"Price: {row['close']:.1f}"
     elif signal_type == "SELLER_EXIT":
         title = "⚫ SELLER EXIT"
-        detail = f"OI Change: {format_delta(row['oi_delta'])}"
-        extra = f"Price: {row['close']:.1f}"
+        detail = f"Price: {row['close']:.1f}"
     elif signal_type == "BUYER_EXIT":
         title = "⚫ BUYER EXIT"
-        detail = f"OI Change: {format_delta(row['oi_delta'])}"
-        extra = f"Price: {row['close']:.1f}"
+        detail = f"Price: {row['close']:.1f}"
     elif signal_type == "BULLISH_FLOW":
         title = "🟢 BULLISH MONEY FLOW"
-        detail = f"Delta: {format_delta(row['delta'])}"
-        extra = f"Volume: {format_volume(row['vol'])}"
+        detail = f"Price: {row['close']:.1f}"
     elif signal_type == "BEARISH_FLOW":
         title = "🔴 BEARISH MONEY FLOW"
-        detail = f"Delta: {format_delta(row['delta'])}"
-        extra = f"Volume: {format_volume(row['vol'])}"
+        detail = f"Price: {row['close']:.1f}"
     else:
         return ""
 
-    return header + f"{title}\n{detail}\n{extra}\n"
+    buy_sell_vol = f"Buy Volume: {format_volume(row['buy_volume'])} · Sell Volume: {format_volume(row['sell_volume'])}"
+    oi_line = f"OI Change: {format_delta(row['oi_delta'])}"
+
+    return (
+        header +
+        f"{title}\n"
+        f"{detail}\n"
+        f"{flow_text(row)}\n"
+        f"{net_flow_text(row)}\n"
+        f"{buy_sell_vol}\n"
+        f"{oi_line}\n"
+        f"{trap_exit_text(row)}\n"
+    )
 
 # ============ TELEGRAM SENDER ============
 def send_telegram_sync(text):
@@ -380,10 +440,10 @@ def check_and_alert():
     last_start = int(df["time"].iloc[-1])
 
     if current_ms < last_start + period_ms:
-        row = df.iloc[-2]
+        row = df.iloc[-2]  # last closed candle
         candle_time = int(df["time"].iloc[-2])
     else:
-        row = df.iloc[-1]
+        row = df.iloc[-1]  # last candle already closed
         candle_time = int(df["time"].iloc[-1])
 
     if last_evaluated_time == candle_time:
