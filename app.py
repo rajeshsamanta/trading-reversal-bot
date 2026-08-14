@@ -40,16 +40,25 @@ OI_EXIT_MIN_ABS_15M = 120.0
 
 # ============ BINANCE FUTURES API ============
 def get_binance_futures_klines(symbol, interval, limit):
-    """Binance Futures klines (candles)"""
+    """Binance Futures klines (candles) with debug"""
     url = "https://fapi.binance.com/fapi/v1/klines"
     params = {
         "symbol": symbol,
         "interval": interval,
         "limit": limit
     }
-    resp = requests.get(url, params=params)
-    data = resp.json()
-    if isinstance(data, list) and len(data) > 0:
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        print(f"Binance klines status: {resp.status_code}")
+        if resp.status_code != 200:
+            print(f"Binance response: {resp.text[:300]}")
+            return None
+        
+        data = resp.json()
+        if not isinstance(data, list) or len(data) == 0:
+            print(f"Unexpected data: {str(data)[:300]}")
+            return None
+        
         df = pd.DataFrame(data, columns=[
             "open_time", "open", "high", "low", "close", "volume",
             "close_time", "quote_volume", "trades", "taker_base",
@@ -57,12 +66,11 @@ def get_binance_futures_klines(symbol, interval, limit):
         ])
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = df[col].astype(float)
-        # Binance open_time is in ms, already chronological ascending
         df = df.reset_index(drop=True)
-        # Rename volume to vol for consistency
         df.rename(columns={"volume": "vol"}, inplace=True)
         return df
-    else:
+    except Exception as e:
+        print(f"Error fetching Binance klines: {e}")
         return None
 
 def get_binance_oi_history(symbol, period, limit):
