@@ -7,6 +7,8 @@ import schedule
 from datetime import datetime, timedelta
 from flask import Flask
 from telegram import Bot
+import sys
+sys.stdout.reconfigure(line_buffering=True)
 
 # ============ CONFIGURATION ============
 TELEGRAM_TOKEN = "8776819788:AAHfoFM_82byoGtR3q6jB0PKHw5S45GBqJI"          # <-- new bot token from BotFather
