@@ -9,10 +9,12 @@ from zoneinfo import ZoneInfo
 from flask import Flask
 from telegram import Bot
 import sys
+from collections import defaultdict
+
 sys.stdout.reconfigure(line_buffering=True)
 
 # ============ CONFIGURATION ============
-TELEGRAM_TOKEN = "8776819788:AAHfoFM_82byoGtR3q6jB0PKHw5S45GBqJI"          # <-- আপনার নতুন Bot Token বসান
+TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"          # <-- আপনার নতুন Bot Token বসান
 CHAT_ID = "-1003988993524"                 # আপনার Channel Chat ID
 
 SYMBOL = "BTC-USDT-SWAP"
@@ -34,18 +36,18 @@ REVERSAL_MINIMUM_SCORE = 4
 DEEP_BLUE_VOLUME_MULT = 3.0
 DEEP_BLUE_DELTA_SHARE = 0.35
 OI_ENTRY_MULT = 1.5
-OI_EXIT_MULT = 1.0
+OI_EXIT_MULT = 1.1                # ১০% বাড়ানো হয়েছে (ছিল 1.0)
 OI_BUILD_MIN_ABS_15M = 110.0
-OI_EXIT_MIN_ABS_15M = 120.0
+OI_EXIT_MIN_ABS_15M = 132.0       # ১০% বাড়ানো হয়েছে (ছিল 120.0)
 DIVERGENCE_EVENT_MULT = 1.2
 
-# POC Settings (from Pine Script)
+# POC Settings
 POC_BIN_SIZE = 1.0
-POC_SOURCE = "HLC3"
-POC_VOLUME_MODE = "Total Volume"
 POC_TIE_BREAK = "Latest"
 
 IN_TZ = ZoneInfo("Asia/Kolkata")
+
+poc_sent = set()
 
 def to_indian_time(ms):
     if ms:
@@ -55,7 +57,6 @@ def to_indian_time(ms):
 
 # ============ OKX API ============
 def get_market_klines(instId, bar, limit):
-    """OKX Futures klines"""
     url = "https://www.okx.com/api/v5/market/candles"
     params = {"instId": instId, "bar": bar, "limit": str(limit)}
     try:
@@ -76,7 +77,6 @@ def get_market_klines(instId, bar, limit):
         return None
 
 def get_oi_history(bar, limit):
-    """OKX Open Interest history"""
     url = "https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-history"
     params = {"instId": SYMBOL, "period": bar, "limit": str(limit)}
     try:
@@ -143,13 +143,6 @@ def calculate_delta(df_main):
 
 # ============ POC CALCULATION (Exact Pine Script Logic) ============
 def compute_poc_from_1m(candles, start_ms, end_ms):
-    """
-    Pine Script-এর মতো POC বের করা:
-    - HLC3 source
-    - Bin size = POC_BIN_SIZE (1.0)
-    - Volume sum per bin
-    - Highest volume bin = POC, tie হলে latest
-    """
     if candles is None or len(candles) == 0:
         return None
 
@@ -160,7 +153,7 @@ def compute_poc_from_1m(candles, start_ms, end_ms):
     if len(window) == 0:
         return None
 
-    step = max(POC_BIN_SIZE, 1.0)  # OKX tick 0.1, তাই 1.0 use হবে
+    step = max(POC_BIN_SIZE, 1.0)
     volume_by_bin = {}
     for _, row in window.iterrows():
         hlc3 = (row["high"] + row["low"] + row["close"]) / 3.0
@@ -171,87 +164,77 @@ def compute_poc_from_1m(candles, start_ms, end_ms):
     if not volume_by_bin:
         return None
 
-    # Max volume; tie -> latest bin (Pine: Latest)
     max_vol = max(volume_by_bin.values())
     max_bins = [k for k, v in volume_by_bin.items() if v == max_vol]
     best_bin = max(max_bins) if POC_TIE_BREAK == "Latest" else max(max_bins)
     return best_bin * step
 
+# ============ POC ALERTS (Combined, Session Start Time) ============
 def check_poc_alerts():
-    """Weekly/Daily/4H POC alerts"""
-    now = datetime.now(IN_TZ)
-    current_minute = now.minute
-    current_hour = now.hour
-    current_weekday = now.weekday()  # Monday=0
-
-    poc_sent_keys = set()  # local; will be persisted via global if needed
-
-    # We use global set to avoid duplicate sends
     global poc_sent
-    if 'poc_sent' not in globals():
-        poc_sent = set()
+    now = datetime.now(IN_TZ)
+    due_sessions = []
 
-    # Weekly POC: Monday 05:35 IST
-    if current_weekday == 0 and current_hour == 5 and current_minute == 35:
-        key = f"WEEKLY-{now.strftime('%Y-%m-%d')}"
-        if key not in poc_sent:
-            start = now - timedelta(minutes=5)
-            start_ms = int(start.timestamp() * 1000)
-            end_ms = int(now.timestamp() * 1000)
-            candles = get_market_klines(SYMBOL, "1m", 500)
+    # Weekly: Monday 05:30 AM
+    if now.weekday() == 0:
+        session = now.replace(hour=5, minute=30, second=0, microsecond=0)
+        if 0 <= (now - session).total_seconds() <= 15 * 60:
+            due_sessions.append(("WEEKLY", session))
+
+    # Daily: every day 05:30 AM
+    session = now.replace(hour=5, minute=30, second=0, microsecond=0)
+    if 0 <= (now - session).total_seconds() <= 15 * 60:
+        due_sessions.append(("DAILY", session))
+
+    # 4H: 01:30, 05:30, 09:30, 13:30, 17:30, 21:30 IST
+    for h, m in [(1, 30), (5, 30), (9, 30), (13, 30), (17, 30), (21, 30)]:
+        session = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if 0 <= (now - session).total_seconds() <= 15 * 60:
+            due_sessions.append(("4H", session))
+
+    # Group by session start
+    grouped = defaultdict(list)
+    for ptype, session in due_sessions:
+        key = session.strftime("%Y-%m-%d %H:%M")
+        if (ptype, key) in poc_sent:
+            continue
+        grouped[session].append(ptype)
+
+    if not grouped:
+        return
+
+    # For each session start, compute POCs and send combined message
+    for session, types in grouped.items():
+        candles = get_market_klines(SYMBOL, "1m", 500)
+        if candles is None:
+            continue
+
+        start_ms = int(session.timestamp() * 1000)
+        end_ms = int((session + timedelta(minutes=5)).timestamp() * 1000)
+
+        lines = []
+        for ptype in types:
             poc = compute_poc_from_1m(candles, start_ms, end_ms)
-            if poc:
-                send_poc_alert("WEEKLY", poc, now)
-                poc_sent.add(key)
+            if poc is not None:
+                color_map = {"WEEKLY": "🟠", "DAILY": "🔵", "4H": "🩵"}
+                color = color_map.get(ptype, "⚪")
+                label = f"{color} {ptype} POC: ${poc:,.2f}"
+                lines.append(label)
 
-    # Daily POC: every day 05:35 IST
-    if current_hour == 5 and current_minute == 35:
-        key = f"DAILY-{now.strftime('%Y-%m-%d')}"
-        if key not in poc_sent:
-            start = now - timedelta(minutes=5)
-            start_ms = int(start.timestamp() * 1000)
-            end_ms = int(now.timestamp() * 1000)
-            candles = get_market_klines(SYMBOL, "1m", 500)
-            poc = compute_poc_from_1m(candles, start_ms, end_ms)
-            if poc:
-                send_poc_alert("DAILY", poc, now)
-                poc_sent.add(key)
+        if lines:
+            msg = f"🕐 {session.strftime('%I:%M %p')} | {session.strftime('%Y-%m-%d')}\n"
+            for label in lines:
+                msg += "━━━━━━━━━━━━━━━\n"
+                msg += label + "\n"
+            msg += "━━━━━━━━━━━━━━━"
 
-    # 4H POC: every 4 hours at :05, :09, :13, :17, :21, :01 (next day)
-    four_hour_hours = [1, 5, 9, 13, 17, 21]
-    if current_minute == 35 and current_hour in four_hour_hours:
-        session_hour = current_hour
-        session_start_minute = 30
-        key = f"4H-{now.strftime('%Y-%m-%d')}-{session_hour:02d}:{session_start_minute:02d}"
-        if key not in poc_sent:
-            start = now - timedelta(minutes=5)
-            start_ms = int(start.timestamp() * 1000)
-            end_ms = int(now.timestamp() * 1000)
-            candles = get_market_klines(SYMBOL, "1m", 500)
-            poc = compute_poc_from_1m(candles, start_ms, end_ms)
-            if poc:
-                send_poc_alert("4H", poc, now)
-                poc_sent.add(key)
-
-def send_poc_alert(poc_type, price, now):
-    color_map = {
-        "WEEKLY": "🟠",
-        "DAILY": "🔵",
-        "4H": "🩵"
-    }
-    color = color_map.get(poc_type, "⚪")
-    label = f"{color} {poc_type} POC: ${price:,.2f}"
-    msg = (
-        f"🕐 {TIMEFRAME} | {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"{label}\n"
-        f"━━━━━━━━━━━━━━━"
-    )
-    try:
-        send_telegram_sync(msg)
-        print(f"✅ Sent {poc_type} POC alert")
-    except Exception as e:
-        print(f"❌ POC alert send error: {e}")
+            try:
+                send_telegram_sync(msg)
+                print(f"✅ Sent POC alert for {session.strftime('%Y-%m-%d %H:%M')}")
+                for ptype in types:
+                    poc_sent.add((ptype, session.strftime("%Y-%m-%d %H:%M")))
+            except Exception as e:
+                print(f"❌ POC send error: {e}")
 
 # ============ SIGNALS ============
 def calculate_signals(df):
@@ -312,7 +295,6 @@ def calculate_signals(df):
     df["candle_up"] = df["close"] > df["open"]
     df["candle_down"] = df["close"] < df["open"]
 
-    # Short cover / Long liquidation
     df["short_cover"] = (
         df["candle_up"] &
         (df["delta"] > 0) &
@@ -341,7 +323,6 @@ def calculate_signals(df):
         df["volume_pass"].astype(int)
     )
 
-    # OI entry/exit
     df["oi_entry_move_ok"] = (df["oi_delta"].abs() >= df["oi_abs_base"] * OI_ENTRY_MULT) & (df["oi_delta"].abs() >= OI_BUILD_MIN_ABS_15M)
     df["oi_exit_move_ok"] = (df["oi_delta"].abs() >= df["oi_abs_base"] * OI_EXIT_MULT) & (df["oi_delta"].abs() >= OI_EXIT_MIN_ABS_15M)
 
@@ -367,13 +348,11 @@ def calculate_signals(df):
         df["candle_down"]
     )
 
-    # OI Divergence
     df["flow_disagrees"] = (df["candle_up"] & (df["delta"] < 0)) | (df["candle_down"] & (df["delta"] > 0))
     df["divergence_move_ok"] = df["oi_delta"].abs() >= df["oi_abs_base"] * DIVERGENCE_EVENT_MULT
     df["bullish_divergence"] = df["divergence_move_ok"] & df["candle_down"] & (df["delta"] > 0)
     df["bearish_divergence"] = df["divergence_move_ok"] & df["candle_up"] & (df["delta"] < 0)
 
-    # Confirmed / Failed Reversals
     df["bull_confirmed"] = df["bull_reversal_candidate"].shift(1) & (df["close"] > df["high"].shift(1))
     df["bear_confirmed"] = df["bear_reversal_candidate"].shift(1) & (df["close"] < df["low"].shift(1))
     df["bull_failed"] = df["bull_reversal_candidate"].shift(1) & (df["close"] < df["low"].shift(1))
@@ -403,13 +382,13 @@ def format_delta(d):
     if abs(d) >= 1000:
         return f"{sign}{format_volume(abs(d))}"
     else:
-        return f"{sign}{d:.0f}"
+        return f"{sign}{abs(d):.0f}"      # fixed double minus
 
 def flow_text(row):
     if row["candle_up"] and row["delta"] < 0:
-        return "Flow: Price up, sellers stronger"
+        return "Flow: Mismatch — Price up, sellers stronger (Sell absorption)"
     elif row["candle_down"] and row["delta"] > 0:
-        return "Flow: Price down, buyers stronger"
+        return "Flow: Mismatch — Price down, buyers stronger (Buy absorption)"
     elif row["delta"] > 0:
         return "Flow: Buyers stronger"
     elif row["delta"] < 0:
@@ -602,13 +581,11 @@ def send_telegram_sync(text):
 
 # ============ MAIN CHECK ============
 last_evaluated_time = None
-poc_sent = set()
 
 def check_and_alert():
     global last_evaluated_time
     print(f"[{datetime.now()}] Checking signals...")
 
-    # Signal check
     df = get_market_klines(SYMBOL, TIMEFRAME, LIMIT)
     if df is None:
         print("❌ Failed to fetch candles")
@@ -660,7 +637,7 @@ def check_and_alert():
         if row["bear_failed"]:
             messages.append(build_reversal_tooltip(row, "BEAR_FAILED", TIMEFRAME, candle_time))
 
-        # Money flow
+        # Money flow signals
         if row["new_buyers_raw"]:
             messages.append(build_moneyflow_tooltip(row, "NEW_BUYERS", TIMEFRAME, candle_time))
         if row["new_sellers_raw"]:
