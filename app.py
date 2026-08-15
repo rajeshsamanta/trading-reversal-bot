@@ -25,6 +25,7 @@ LOWER_LIMIT = 1000
 VOLUME_LOOKBACK = 50
 OI_LOOKBACK = 42
 
+# Reversal data inputs (Bull unchanged)
 REVERSAL_IMPULSE_LOOKBACK = 12
 REVERSAL_MIN_IMPULSE = 1000.0
 REVERSAL_SWING_LOOKBACK = 8
@@ -33,13 +34,30 @@ REVERSAL_DELTA_SHARE_THRESHOLD = 0.25
 REVERSAL_OI_MULTIPLIER = 1.0
 REVERSAL_MINIMUM_SCORE = 4
 
+# BEAR REVERSAL-এর জন্য 5% strict multiplier (শুধু Bear-এ ব্যবহার হবে)
+BEAR_REVERSAL_MIN_IMPULSE = 1050.0
+BEAR_REVERSAL_VOLUME_MULTIPLIER = 1.575
+BEAR_REVERSAL_DELTA_SHARE_THRESHOLD = 0.2625
+BEAR_REVERSAL_OI_MULTIPLIER = 1.05
+
+# Money Flow thresholds (Bull/Bear shift)
 DEEP_BLUE_VOLUME_MULT = 3.0
 DEEP_BLUE_DELTA_SHARE = 0.35
-OI_ENTRY_MULT = 1.875                # New Buyers/New Sellers: 25% বাড়ানো হয়েছে (ছিল 1.5)
-OI_BUILD_MIN_ABS_15M = 137.5         # New Buyers/New Sellers: 25% বাড়ানো হয়েছে (ছিল 110.0)
-OI_EXIT_MULT = 1.1                  # Black dot: 10% বাড়ানো হয়েছে (ছিল 1.0)
-OI_EXIT_MIN_ABS_15M = 132.0         # Black dot: 10% বাড়ানো হয়েছে (ছিল 120.0)
+
+# New Buyers / New Sellers (আগে 25% বাড়ানো হয়েছে)
+OI_ENTRY_MULT = 1.875
+OI_BUILD_MIN_ABS_15M = 137.5
+
+# Black Dot: 5% বাড়ানো হয়েছে (ছিল 1.1 / 132.0)
+OI_EXIT_MULT = 1.155
+OI_EXIT_MIN_ABS_15M = 138.6
+
 DIVERGENCE_EVENT_MULT = 1.2
+
+# TRAPPED BUYERS/SELLERS-এর জন্য নতুন strict thresholds (A+B+C)
+TRAPPED_OI_MULT = 1.05
+TRAPPED_VOLUME_MULT = 1.05
+TRAPPED_DELTA_SHARE_MIN = 0.05
 
 # POC Settings
 POC_BIN_SIZE = 1.0
@@ -108,6 +126,7 @@ def get_oi_history(bar, limit):
 def calculate_delta(df_main):
     lower_df = get_market_klines(SYMBOL, LOWER_TF, LOWER_LIMIT)
     if lower_df is None:
+        # fallback: candle direction based approximation
         df_main["buy_volume"] = df_main.apply(lambda r: r["vol"] if r["close"] > r["open"] else r["vol"]*0.5 if r["close"]==r["open"] else 0, axis=1)
         df_main["sell_volume"] = df_main.apply(lambda r: r["vol"] if r["close"] < r["open"] else r["vol"]*0.5 if r["close"]==r["open"] else 0, axis=1)
         df_main["delta"] = df_main["buy_volume"] - df_main["sell_volume"]
@@ -194,7 +213,6 @@ def check_poc_alerts():
         if 0 <= (now - session).total_seconds() <= 15 * 60:
             due_sessions.append(("4H", session))
 
-    # Group by session start
     grouped = defaultdict(list)
     for ptype, session in due_sessions:
         key = session.strftime("%Y-%m-%d %H:%M")
@@ -273,6 +291,13 @@ def calculate_signals(df):
     df["bull_flow_pass"] = (df["delta"] < 0) | ((df["delta"] > 0) & df["oi_decrease"])
     df["bear_flow_pass"] = (df["delta"] > 0) | ((df["delta"] < 0) & df["oi_decrease"])
 
+    # BEAR-specific stricter passes
+    df["bear_impulse_pass"] = df["impulse_range"] >= BEAR_REVERSAL_MIN_IMPULSE
+    df["bear_volume_pass"] = df["vol"] >= df["volume_base"] * BEAR_REVERSAL_VOLUME_MULTIPLIER
+    df["bear_delta_pass"] = df["delta_share"] >= BEAR_REVERSAL_DELTA_SHARE_THRESHOLD
+    df["bear_oi_pass"] = df["oi_delta"].abs() >= df["oi_abs_base"] * BEAR_REVERSAL_OI_MULTIPLIER
+
+    # Bull score: original thresholds
     df["bull_score"] = (
         df["impulse_pass"].astype(int) +
         df["bull_sweep"].astype(int) +
@@ -281,13 +306,15 @@ def calculate_signals(df):
         (df["delta_pass"] & df["bull_flow_pass"]).astype(int) +
         (df["oi_pass"] & df["oi_decrease"]).astype(int)
     )
+
+    # Bear score: stricter thresholds
     df["bear_score"] = (
-        df["impulse_pass"].astype(int) +
+        df["bear_impulse_pass"].astype(int) +
         df["bear_sweep"].astype(int) +
         df["bear_reject"].astype(int) +
-        df["volume_pass"].astype(int) +
-        (df["delta_pass"] & df["bear_flow_pass"]).astype(int) +
-        (df["oi_pass"] & df["oi_decrease"]).astype(int)
+        df["bear_volume_pass"].astype(int) +
+        (df["bear_delta_pass"] & df["bear_flow_pass"]).astype(int) +
+        (df["bear_oi_pass"] & df["oi_decrease"]).astype(int)
     )
 
     df["bull_reversal_candidate"] = df["bull_sweep"] & df["bull_reject"] & (df["bull_score"] >= REVERSAL_MINIMUM_SCORE)
@@ -296,6 +323,7 @@ def calculate_signals(df):
     df["candle_up"] = df["close"] > df["open"]
     df["candle_down"] = df["close"] < df["open"]
 
+    # Short cover / Long liquidation
     df["short_cover"] = (
         df["candle_up"] &
         (df["delta"] > 0) &
@@ -333,8 +361,23 @@ def calculate_signals(df):
     df["buyers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_down"]
     df["sellers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_up"]
 
-    df["trapped_buyers_raw"] = df["candle_up"] & df["oi_decrease"] & (df["delta"] < 0)
-    df["trapped_sellers_raw"] = df["candle_down"] & df["oi_decrease"] & (df["delta"] > 0)
+    # TRAPPED BUYERS/SELLERS with A+B+C strict thresholds
+    df["trapped_buyers_raw"] = (
+        df["candle_up"] &
+        df["oi_decrease"] &
+        (df["delta"] < 0) &
+        (df["oi_delta"].abs() >= df["oi_abs_base"] * TRAPPED_OI_MULT) &
+        (df["vol"] >= df["volume_base"] * TRAPPED_VOLUME_MULT) &
+        (df["delta"].abs() / df["vol"].clip(lower=1) >= TRAPPED_DELTA_SHARE_MIN)
+    )
+    df["trapped_sellers_raw"] = (
+        df["candle_down"] &
+        df["oi_decrease"] &
+        (df["delta"] > 0) &
+        (df["oi_delta"].abs() >= df["oi_abs_base"] * TRAPPED_OI_MULT) &
+        (df["vol"] >= df["volume_base"] * TRAPPED_VOLUME_MULT) &
+        (df["delta"].abs() / df["vol"].clip(lower=1) >= TRAPPED_DELTA_SHARE_MIN)
+    )
 
     df["bull_shift_raw"] = (
         (df["vol"] >= df["volume_base"] * DEEP_BLUE_VOLUME_MULT) &
