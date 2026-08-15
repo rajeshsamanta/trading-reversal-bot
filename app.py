@@ -14,7 +14,7 @@ from collections import defaultdict
 sys.stdout.reconfigure(line_buffering=True)
 
 # ============ CONFIGURATION ============
-TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"          # <-- আপনার নতুন Bot Token বসান
+TELEGRAM_TOKEN = "8776819788:AAHfoFM_82byoGtR3q6jB0PKHw5S45GBqJI"          # <-- আপনার নতুন Bot Token বসান
 CHAT_ID = "-1003988993524"                 # আপনার Channel Chat ID
 
 SYMBOL = "BTC-USDT-SWAP"
@@ -35,10 +35,10 @@ REVERSAL_MINIMUM_SCORE = 4
 
 DEEP_BLUE_VOLUME_MULT = 3.0
 DEEP_BLUE_DELTA_SHARE = 0.35
-OI_ENTRY_MULT = 1.5
-OI_EXIT_MULT = 1.1                # ১০% বাড়ানো হয়েছে (ছিল 1.0)
-OI_BUILD_MIN_ABS_15M = 110.0
-OI_EXIT_MIN_ABS_15M = 132.0       # ১০% বাড়ানো হয়েছে (ছিল 120.0)
+OI_ENTRY_MULT = 1.875                # New Buyers/New Sellers: 25% বাড়ানো হয়েছে (ছিল 1.5)
+OI_BUILD_MIN_ABS_15M = 137.5         # New Buyers/New Sellers: 25% বাড়ানো হয়েছে (ছিল 110.0)
+OI_EXIT_MULT = 1.1                  # Black dot: 10% বাড়ানো হয়েছে (ছিল 1.0)
+OI_EXIT_MIN_ABS_15M = 132.0         # Black dot: 10% বাড়ানো হয়েছে (ছিল 120.0)
 DIVERGENCE_EVENT_MULT = 1.2
 
 # POC Settings
@@ -57,6 +57,7 @@ def to_indian_time(ms):
 
 # ============ OKX API ============
 def get_market_klines(instId, bar, limit):
+    """OKX Futures klines"""
     url = "https://www.okx.com/api/v5/market/candles"
     params = {"instId": instId, "bar": bar, "limit": str(limit)}
     try:
@@ -77,6 +78,7 @@ def get_market_klines(instId, bar, limit):
         return None
 
 def get_oi_history(bar, limit):
+    """OKX Open Interest history"""
     url = "https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-history"
     params = {"instId": SYMBOL, "period": bar, "limit": str(limit)}
     try:
@@ -203,7 +205,6 @@ def check_poc_alerts():
     if not grouped:
         return
 
-    # For each session start, compute POCs and send combined message
     for session, types in grouped.items():
         candles = get_market_klines(SYMBOL, "1m", 500)
         if candles is None:
