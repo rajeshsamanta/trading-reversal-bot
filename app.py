@@ -34,7 +34,7 @@ REVERSAL_DELTA_SHARE_THRESHOLD = 0.25
 REVERSAL_OI_MULTIPLIER = 1.0
 REVERSAL_MINIMUM_SCORE = 4
 
-# BEAR REVERSAL-এর জন্য 5% strict multiplier (শুধু Bear-এ ব্যবহার হবে)
+# BEAR REVERSAL-এর জন্য 5% strict multiplier
 BEAR_REVERSAL_MIN_IMPULSE = 1050.0
 BEAR_REVERSAL_VOLUME_MULTIPLIER = 1.575
 BEAR_REVERSAL_DELTA_SHARE_THRESHOLD = 0.2625
@@ -44,17 +44,17 @@ BEAR_REVERSAL_OI_MULTIPLIER = 1.05
 DEEP_BLUE_VOLUME_MULT = 3.0
 DEEP_BLUE_DELTA_SHARE = 0.35
 
-# New Buyers / New Sellers (আগে 25% বাড়ানো হয়েছে)
-OI_ENTRY_MULT = 1.875
-OI_BUILD_MIN_ABS_15M = 137.5
+# New Buyers / New Sellers (Green Dot) - 25% + 10% = total 35% increase from base
+OI_ENTRY_MULT = 2.06                 
+OI_BUILD_MIN_ABS_15M = 151.2
 
-# Black Dot: 5% বাড়ানো হয়েছে (ছিল 1.1 / 132.0)
-OI_EXIT_MULT = 1.155
-OI_EXIT_MIN_ABS_15M = 138.6
+# Black Dot (Buyers/Sellers Exiting) - 5% + 10% = total 15% increase from base
+OI_EXIT_MULT = 1.27                  
+OI_EXIT_MIN_ABS_15M = 152.5
 
 DIVERGENCE_EVENT_MULT = 1.2
 
-# TRAPPED BUYERS/SELLERS-এর জন্য নতুন strict thresholds (A+B+C)
+# TRAPPED BUYERS/SELLERS-এর জন্য strict thresholds (A+B+C)
 TRAPPED_OI_MULT = 1.05
 TRAPPED_VOLUME_MULT = 1.05
 TRAPPED_DELTA_SHARE_MIN = 0.05
@@ -126,7 +126,6 @@ def get_oi_history(bar, limit):
 def calculate_delta(df_main):
     lower_df = get_market_klines(SYMBOL, LOWER_TF, LOWER_LIMIT)
     if lower_df is None:
-        # fallback: candle direction based approximation
         df_main["buy_volume"] = df_main.apply(lambda r: r["vol"] if r["close"] > r["open"] else r["vol"]*0.5 if r["close"]==r["open"] else 0, axis=1)
         df_main["sell_volume"] = df_main.apply(lambda r: r["vol"] if r["close"] < r["open"] else r["vol"]*0.5 if r["close"]==r["open"] else 0, axis=1)
         df_main["delta"] = df_main["buy_volume"] - df_main["sell_volume"]
@@ -190,24 +189,21 @@ def compute_poc_from_1m(candles, start_ms, end_ms):
     best_bin = max(max_bins) if POC_TIE_BREAK == "Latest" else max(max_bins)
     return best_bin * step
 
-# ============ POC ALERTS (Combined, Session Start Time) ============
+# ============ POC ALERTS (Three languages) ============
 def check_poc_alerts():
     global poc_sent
     now = datetime.now(IN_TZ)
     due_sessions = []
 
-    # Weekly: Monday 05:30 AM
     if now.weekday() == 0:
         session = now.replace(hour=5, minute=30, second=0, microsecond=0)
         if 0 <= (now - session).total_seconds() <= 15 * 60:
             due_sessions.append(("WEEKLY", session))
 
-    # Daily: every day 05:30 AM
     session = now.replace(hour=5, minute=30, second=0, microsecond=0)
     if 0 <= (now - session).total_seconds() <= 15 * 60:
         due_sessions.append(("DAILY", session))
 
-    # 4H: 01:30, 05:30, 09:30, 13:30, 17:30, 21:30 IST
     for h, m in [(1, 30), (5, 30), (9, 30), (13, 30), (17, 30), (21, 30)]:
         session = now.replace(hour=h, minute=m, second=0, microsecond=0)
         if 0 <= (now - session).total_seconds() <= 15 * 60:
@@ -231,18 +227,33 @@ def check_poc_alerts():
         start_ms = int(session.timestamp() * 1000)
         end_ms = int((session + timedelta(minutes=5)).timestamp() * 1000)
 
-        lines = []
+        lines_en, lines_hi, lines_bn = [], [], []
         for ptype in types:
             poc = compute_poc_from_1m(candles, start_ms, end_ms)
             if poc is not None:
                 color_map = {"WEEKLY": "🟠", "DAILY": "🔵", "4H": "🩵"}
                 color = color_map.get(ptype, "⚪")
-                label = f"{color} {ptype} POC: ${poc:,.2f}"
-                lines.append(label)
+                label_en = f"{color} {ptype} POC: ${poc:,.2f}"
+                label_hi = f"{color} {ptype} POC: ${poc:,.2f}"
+                label_bn = f"{color} {ptype} POC: ${poc:,.2f}"
+                lines_en.append(label_en)
+                lines_hi.append(label_hi)
+                lines_bn.append(label_bn)
 
-        if lines:
+        if lines_en:
             msg = f"🕐 {session.strftime('%I:%M %p')} | {session.strftime('%Y-%m-%d')}\n"
-            for label in lines:
+            msg += "[ENGLISH]\n"
+            for label in lines_en:
+                msg += "━━━━━━━━━━━━━━━\n"
+                msg += label + "\n"
+            msg += "━━━━━━━━━━━━━━━\n\n"
+            msg += "[HINDI]\n"
+            for label in lines_hi:
+                msg += "━━━━━━━━━━━━━━━\n"
+                msg += label + "\n"
+            msg += "━━━━━━━━━━━━━━━\n\n"
+            msg += "[BENGALI]\n"
+            for label in lines_bn:
                 msg += "━━━━━━━━━━━━━━━\n"
                 msg += label + "\n"
             msg += "━━━━━━━━━━━━━━━"
@@ -291,13 +302,11 @@ def calculate_signals(df):
     df["bull_flow_pass"] = (df["delta"] < 0) | ((df["delta"] > 0) & df["oi_decrease"])
     df["bear_flow_pass"] = (df["delta"] > 0) | ((df["delta"] < 0) & df["oi_decrease"])
 
-    # BEAR-specific stricter passes
     df["bear_impulse_pass"] = df["impulse_range"] >= BEAR_REVERSAL_MIN_IMPULSE
     df["bear_volume_pass"] = df["vol"] >= df["volume_base"] * BEAR_REVERSAL_VOLUME_MULTIPLIER
     df["bear_delta_pass"] = df["delta_share"] >= BEAR_REVERSAL_DELTA_SHARE_THRESHOLD
     df["bear_oi_pass"] = df["oi_delta"].abs() >= df["oi_abs_base"] * BEAR_REVERSAL_OI_MULTIPLIER
 
-    # Bull score: original thresholds
     df["bull_score"] = (
         df["impulse_pass"].astype(int) +
         df["bull_sweep"].astype(int) +
@@ -307,7 +316,6 @@ def calculate_signals(df):
         (df["oi_pass"] & df["oi_decrease"]).astype(int)
     )
 
-    # Bear score: stricter thresholds
     df["bear_score"] = (
         df["bear_impulse_pass"].astype(int) +
         df["bear_sweep"].astype(int) +
@@ -323,7 +331,6 @@ def calculate_signals(df):
     df["candle_up"] = df["close"] > df["open"]
     df["candle_down"] = df["close"] < df["open"]
 
-    # Short cover / Long liquidation
     df["short_cover"] = (
         df["candle_up"] &
         (df["delta"] > 0) &
@@ -361,7 +368,6 @@ def calculate_signals(df):
     df["buyers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_down"]
     df["sellers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_up"]
 
-    # TRAPPED BUYERS/SELLERS with A+B+C strict thresholds
     df["trapped_buyers_raw"] = (
         df["candle_up"] &
         df["oi_decrease"] &
@@ -426,9 +432,9 @@ def format_delta(d):
     if abs(d) >= 1000:
         return f"{sign}{format_volume(abs(d))}"
     else:
-        return f"{sign}{abs(d):.0f}"      # fixed double minus
+        return f"{sign}{abs(d):.0f}"
 
-def flow_text(row):
+def flow_text_en(row):
     if row["candle_up"] and row["delta"] < 0:
         return "Flow: Mismatch — Price up, sellers stronger (Sell absorption)"
     elif row["candle_down"] and row["delta"] > 0:
@@ -440,7 +446,31 @@ def flow_text(row):
     else:
         return "Flow: Neutral"
 
-def net_flow_text(row):
+def flow_text_hi(row):
+    if row["candle_up"] and row["delta"] < 0:
+        return "प्रवाह: बेमेल — कीमत ऊपर, विक्रेता मजबूत (सेल अवशोषण)"
+    elif row["candle_down"] and row["delta"] > 0:
+        return "प्रवाह: बेमेल — कीमत नीचे, खरीदार मजबूत (खरीद अवशोषण)"
+    elif row["delta"] > 0:
+        return "प्रवाह: खरीदार मजबूत"
+    elif row["delta"] < 0:
+        return "प्रवाह: विक्रेता मजबूत"
+    else:
+        return "प्रवाह: तटस्थ"
+
+def flow_text_bn(row):
+    if row["candle_up"] and row["delta"] < 0:
+        return "প্রবাহ: মিসম্যাচ — দাম উপরে, বিক্রেতারা শক্তিশালী (সেল শোষণ)"
+    elif row["candle_down"] and row["delta"] > 0:
+        return "প্রবাহ: মিসম্যাচ — দাম নিচে, ক্রেতারা শক্তিশালী (বাই শোষণ)"
+    elif row["delta"] > 0:
+        return "প্রবাহ: ক্রেতারা শক্তিশালী"
+    elif row["delta"] < 0:
+        return "প্রবাহ: বিক্রেতারা শক্তিশালী"
+    else:
+        return "প্রবাহ: নিরপেক্ষ"
+
+def net_flow_text_en(row):
     if pd.isna(row["delta"]):
         return "Net: n/a"
     elif row["delta"] > 0:
@@ -450,7 +480,27 @@ def net_flow_text(row):
     else:
         return "Net: Neutral"
 
-def trap_exit_text(row):
+def net_flow_text_hi(row):
+    if pd.isna(row["delta"]):
+        return "नेट: n/a"
+    elif row["delta"] > 0:
+        return f"नेट खरीदार: {format_volume(row['delta'])}"
+    elif row["delta"] < 0:
+        return f"नेट विक्रेता: {format_volume(row['delta'])}"
+    else:
+        return "नेट: तटस्थ"
+
+def net_flow_text_bn(row):
+    if pd.isna(row["delta"]):
+        return "নেট: n/a"
+    elif row["delta"] > 0:
+        return f"নেট ক্রেতা: {format_volume(row['delta'])}"
+    elif row["delta"] < 0:
+        return f"নেট বিক্রেতা: {format_volume(row['delta'])}"
+    else:
+        return "নেট: নিরপেক্ষ"
+
+def trap_exit_text_en(row):
     parts = []
     if row.get("trapped_buyers_raw", False):
         parts.append("Trap / Force Exit: Buyers trapped")
@@ -462,158 +512,323 @@ def trap_exit_text(row):
         parts.append("Exit: Sellers exiting")
     return " | ".join(parts) if parts else "Trap / Force Exit: none"
 
-# ============ MESSAGE BUILDERS ============
-def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
-    if signal_type == "SHORT_COVER":
-        title = f"SHORT COVER [{strength_text(row['short_cover_score'], 4)}]"
-        detail = "Shorts buying back"
-        bias = "UP - squeeze possible"
-        invalid = f"below {row['prior_low']:.1f} (flush low)"
-        next_text = "UP - next squeeze possible"
-        level = f"Squeeze High: {row['prior_high']:.1f}"
-        score = f"{int(row['short_cover_score'])}/4"
-        confirm = f"BUY only on close above {row['high']:.1f}"
-    elif signal_type == "LONG_LIQ":
-        title = f"LONG LIQUIDATION [{strength_text(row['long_liq_score'], 4)}]"
-        detail = "Longs liquidating"
-        bias = "DOWN - continuation risk"
-        invalid = f"above {row['prior_high']:.1f} (squeeze high)"
-        next_text = "DOWN - continuation risk"
-        level = f"Flush Low: {row['prior_low']:.1f}"
-        score = f"{int(row['long_liq_score'])}/4"
-        confirm = f"SELL only on close below {row['low']:.1f}"
-    elif signal_type == "BULL_REVERSAL":
-        title = f"BULL REVERSAL [{strength_text(row['bull_score'], 6)}]"
-        detail = "+ TRAPPED SELLERS" if (row['candle_down'] and row['oi_decrease'] and row['delta'] > 0) else "Score-based exhaustion signal"
-        bias = "UP"
-        invalid = f"below {row['low']:.1f} (flush low)"
-        next_text = "UP - follow-through possible"
-        level = f"Squeeze High: {row['prior_high']:.1f}"
-        score = f"{int(row['bull_score'])}/6"
-        confirm = f"BUY only on close above {row['high']:.1f}"
-    elif signal_type == "BEAR_REVERSAL":
-        title = f"BEAR REVERSAL [{strength_text(row['bear_score'], 6)}]"
-        detail = "+ TRAPPED BUYERS" if (row['candle_up'] and row['oi_decrease'] and row['delta'] < 0) else "Score-based exhaustion signal"
-        bias = "DOWN"
-        invalid = f"above {row['high']:.1f} (squeeze high)"
-        next_text = "DOWN - follow-through needed"
-        level = f"Flush Low: {row['prior_low']:.1f}"
-        score = f"{int(row['bear_score'])}/6"
-        confirm = f"SELL only on close below {row['low']:.1f}"
-    elif signal_type == "CONFIRMED_BULL":
-        title = "CONFIRMED BULL REVERSAL"
-        detail = "Closed above the reversal candle high - follow-through in"
-        bias = "UP"
-        invalid = f"below {row['low']:.1f} (flush low)"
-        next_text = "UP - follow-through / squeeze possible"
-        level = f"Squeeze High: {row['high']:.1f}"
-        score = f"{int(row['bull_score'])}/6"
-        confirm = f"Buy confirmed above {row['high']:.1f}"
-    elif signal_type == "CONFIRMED_BEAR":
-        title = "CONFIRMED BEAR REVERSAL"
-        detail = "Closed below the reversal candle low - follow-through in"
-        bias = "DOWN"
-        invalid = f"above {row['high']:.1f} (squeeze high)"
-        next_text = "DOWN - continuation risk"
-        level = f"Flush Low: {row['low']:.1f}"
-        score = f"{int(row['bear_score'])}/6"
-        confirm = f"Sell confirmed below {row['low']:.1f}"
-    elif signal_type == "BULL_FAILED":
-        title = "REVX - BULL REVERSAL FAILED"
-        detail = "Price failed the bullish reversal setup"
-        bias = "DOWN / CONTINUATION RISK"
-        invalid = f"below {row['low']:.1f}"
-        next_text = "DOWN - continuation risk"
-        level = f"Flush Low: {row['low']:.1f}"
-        score = f"{int(row['bull_score'])}/6"
-        confirm = f"Buy only above {row['high']:.1f}"
-    elif signal_type == "BEAR_FAILED":
-        title = "REVX - BEAR REVERSAL FAILED"
-        detail = "Price failed the bearish reversal setup"
-        bias = "UP / CONTINUATION RISK"
-        invalid = f"above {row['high']:.1f}"
-        next_text = "UP - squeeze possible"
-        level = f"Squeeze High: {row['high']:.1f}"
-        score = f"{int(row['bear_score'])}/6"
-        confirm = f"Sell only below {row['low']:.1f}"
-    else:
-        return ""
+def trap_exit_text_hi(row):
+    parts = []
+    if row.get("trapped_buyers_raw", False):
+        parts.append("ट्रैप / फोर्स एग्जिट: खरीदार फंसे")
+    if row.get("trapped_sellers_raw", False):
+        parts.append("ट्रैप / फोर्स एग्जिट: विक्रेता फंसे")
+    if row.get("buyers_exiting_raw", False):
+        parts.append("एग्जिट: खरीदार बाहर")
+    if row.get("sellers_exiting_raw", False):
+        parts.append("एग्जिट: विक्रेता बाहर")
+    return " | ".join(parts) if parts else "ट्रैप / फोर्स एग्जिट: कोई नहीं"
 
+def trap_exit_text_bn(row):
+    parts = []
+    if row.get("trapped_buyers_raw", False):
+        parts.append("ট্র্যাপ / ফোর্স এক্সিট: ক্রেতারা আটকা পড়েছে")
+    if row.get("trapped_sellers_raw", False):
+        parts.append("ট্র্যাপ / ফোর্স এক্সিট: বিক্রেতারা আটকা পড়েছে")
+    if row.get("buyers_exiting_raw", False):
+        parts.append("এক্সিট: ক্রেতারা বেরিয়ে যাচ্ছে")
+    if row.get("sellers_exiting_raw", False):
+        parts.append("এক্সিট: বিক্রেতারা বেরিয়ে যাচ্ছে")
+    return " | ".join(parts) if parts else "ট্র্যাপ / ফোর্স এক্সিট: কেউ না"
+
+# ============ MESSAGE BUILDERS (Three languages) ============
+def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
     time_str = to_indian_time(candle_time)
     header = f"🕐 {timeframe} | {time_str}\n"
 
-    return (
+    # English
+    if signal_type == "SHORT_COVER":
+        title_en = f"SHORT COVER [{strength_text(row['short_cover_score'], 4)}]"
+        detail_en = "Shorts buying back"
+        bias_en = "UP - squeeze possible"
+        invalid_en = f"below {row['prior_low']:.1f} (flush low)"
+        next_text_en = "UP - next squeeze possible"
+        level_en = f"Squeeze High: {row['prior_high']:.1f}"
+        score_en = f"{int(row['short_cover_score'])}/4"
+        confirm_en = f"BUY only on close above {row['high']:.1f}"
+    elif signal_type == "LONG_LIQ":
+        title_en = f"LONG LIQUIDATION [{strength_text(row['long_liq_score'], 4)}]"
+        detail_en = "Longs liquidating"
+        bias_en = "DOWN - continuation risk"
+        invalid_en = f"above {row['prior_high']:.1f} (squeeze high)"
+        next_text_en = "DOWN - continuation risk"
+        level_en = f"Flush Low: {row['prior_low']:.1f}"
+        score_en = f"{int(row['long_liq_score'])}/4"
+        confirm_en = f"SELL only on close below {row['low']:.1f}"
+    elif signal_type == "BULL_REVERSAL":
+        title_en = f"BULL REVERSAL [{strength_text(row['bull_score'], 6)}]"
+        detail_en = "+ TRAPPED SELLERS" if (row['candle_down'] and row['oi_decrease'] and row['delta'] > 0) else "Score-based exhaustion signal"
+        bias_en = "UP"
+        invalid_en = f"below {row['low']:.1f} (flush low)"
+        next_text_en = "UP - follow-through possible"
+        level_en = f"Squeeze High: {row['prior_high']:.1f}"
+        score_en = f"{int(row['bull_score'])}/6"
+        confirm_en = f"BUY only on close above {row['high']:.1f}"
+    elif signal_type == "BEAR_REVERSAL":
+        title_en = f"BEAR REVERSAL [{strength_text(row['bear_score'], 6)}]"
+        detail_en = "+ TRAPPED BUYERS" if (row['candle_up'] and row['oi_decrease'] and row['delta'] < 0) else "Score-based exhaustion signal"
+        bias_en = "DOWN"
+        invalid_en = f"above {row['high']:.1f} (squeeze high)"
+        next_text_en = "DOWN - follow-through needed"
+        level_en = f"Flush Low: {row['prior_low']:.1f}"
+        score_en = f"{int(row['bear_score'])}/6"
+        confirm_en = f"SELL only on close below {row['low']:.1f}"
+    elif signal_type == "CONFIRMED_BULL":
+        title_en = "CONFIRMED BULL REVERSAL"
+        detail_en = "Closed above the reversal candle high - follow-through in"
+        bias_en = "UP"
+        invalid_en = f"below {row['low']:.1f} (flush low)"
+        next_text_en = "UP - follow-through / squeeze possible"
+        level_en = f"Squeeze High: {row['high']:.1f}"
+        score_en = f"{int(row['bull_score'])}/6"
+        confirm_en = f"Buy confirmed above {row['high']:.1f}"
+    elif signal_type == "CONFIRMED_BEAR":
+        title_en = "CONFIRMED BEAR REVERSAL"
+        detail_en = "Closed below the reversal candle low - follow-through in"
+        bias_en = "DOWN"
+        invalid_en = f"above {row['high']:.1f} (squeeze high)"
+        next_text_en = "DOWN - continuation risk"
+        level_en = f"Flush Low: {row['low']:.1f}"
+        score_en = f"{int(row['bear_score'])}/6"
+        confirm_en = f"Sell confirmed below {row['low']:.1f}"
+    elif signal_type == "BULL_FAILED":
+        title_en = "REVX - BULL REVERSAL FAILED"
+        detail_en = "Price failed the bullish reversal setup"
+        bias_en = "DOWN / CONTINUATION RISK"
+        invalid_en = f"below {row['low']:.1f}"
+        next_text_en = "DOWN - continuation risk"
+        level_en = f"Flush Low: {row['low']:.1f}"
+        score_en = f"{int(row['bull_score'])}/6"
+        confirm_en = f"Buy only above {row['high']:.1f}"
+    elif signal_type == "BEAR_FAILED":
+        title_en = "REVX - BEAR REVERSAL FAILED"
+        detail_en = "Price failed the bearish reversal setup"
+        bias_en = "UP / CONTINUATION RISK"
+        invalid_en = f"above {row['high']:.1f}"
+        next_text_en = "UP - squeeze possible"
+        level_en = f"Squeeze High: {row['high']:.1f}"
+        score_en = f"{int(row['bear_score'])}/6"
+        confirm_en = f"Sell only below {row['low']:.1f}"
+    else:
+        return ""
+
+    # Hindi and Bengali via replacement of common phrases (simplified)
+    # We'll use basic translate function
+    def translate_to_hi(text):
+        text = text.replace("SHORT COVER", "शॉर्ट कवर")
+        text = text.replace("LONG LIQUIDATION", "लॉन्ग लिक्विडेशन")
+        text = text.replace("BULL REVERSAL", "बुल रिवर्सल")
+        text = text.replace("BEAR REVERSAL", "बियर रिवर्सल")
+        text = text.replace("CONFIRMED BULL REVERSAL", "कन्फर्म्ड बुल रिवर्सल")
+        text = text.replace("CONFIRMED BEAR REVERSAL", "कन्फर्म्ड बियर रिवर्सल")
+        text = text.replace("REVX - BULL REVERSAL FAILED", "REVX - बुल रिवर्सल फेल")
+        text = text.replace("REVX - BEAR REVERSAL FAILED", "REVX - बियर रिवर्सल फेल")
+        text = text.replace("Shorts buying back", "शॉर्ट सेलर खरीद रहे हैं")
+        text = text.replace("Longs liquidating", "लॉन्ग लिक्विडेट हो रहे हैं")
+        text = text.replace("Score-based exhaustion signal", "स्कोर-आधारित थकावट संकेत")
+        text = text.replace("UP - squeeze possible", "ऊपर - स्क्वीज़ संभव")
+        text = text.replace("DOWN - continuation risk", "नीचे - निरंतरता जोखिम")
+        text = text.replace("UP - follow-through possible", "ऊपर - फॉलो-थ्रू संभव")
+        text = text.replace("DOWN - follow-through needed", "नीचे - फॉलो-थ्रू आवश्यक")
+        text = text.replace("Squeeze High:", "स्क्वीज़ हाई:")
+        text = text.replace("Flush Low:", "फ्लश लो:")
+        text = text.replace("BUY only on close above", "केवल ऊपर बंद होने पर खरीदें")
+        text = text.replace("SELL only on close below", "केवल नीचे बंद होने पर बेचें")
+        text = text.replace("Buy confirmed above", "ऊपर खरीद की पुष्टि")
+        text = text.replace("Sell confirmed below", "नीचे बिक्री की पुष्टि")
+        text = text.replace("Buy only above", "केवल ऊपर खरीदें")
+        text = text.replace("Sell only below", "केवल नीचे बेचें")
+        text = text.replace("Price failed the bullish reversal setup", "कीमत बुलिश रिवर्सल सेटअप में विफल रही")
+        text = text.replace("Price failed the bearish reversal setup", "कीमत बेयरिश रिवर्सल सेटअप में विफल रही")
+        text = text.replace("DOWN / CONTINUATION RISK", "नीचे / निरंतरता जोखिम")
+        text = text.replace("UP / CONTINUATION RISK", "ऊपर / निरंतरता जोखिम")
+        return text
+
+    def translate_to_bn(text):
+        text = text.replace("SHORT COVER", "শর্ট কভার")
+        text = text.replace("LONG LIQUIDATION", "লং লিকুইডেশন")
+        text = text.replace("BULL REVERSAL", "বুল রিভার্সাল")
+        text = text.replace("BEAR REVERSAL", "বিয়ার রিভার্সাল")
+        text = text.replace("CONFIRMED BULL REVERSAL", "কনফার্মড বুল রিভার্সাল")
+        text = text.replace("CONFIRMED BEAR REVERSAL", "কনফার্মড বিয়ার রিভার্সাল")
+        text = text.replace("REVX - BULL REVERSAL FAILED", "REVX - বুল রিভার্সাল ব্যর্থ")
+        text = text.replace("REVX - BEAR REVERSAL FAILED", "REVX - বিয়ার রিভার্সাল ব্যর্থ")
+        text = text.replace("Shorts buying back", "শর্ট সেলাররা কিনছে")
+        text = text.replace("Longs liquidating", "লং লিকুইডেট হচ্ছে")
+        text = text.replace("Score-based exhaustion signal", "স্কোর-ভিত্তিক ক্লান্তি সংকেত")
+        text = text.replace("UP - squeeze possible", "আপ - স্কুইজ সম্ভব")
+        text = text.replace("DOWN - continuation risk", "ডাউন - ধারাবাহিকতার ঝুঁকি")
+        text = text.replace("UP - follow-through possible", "আপ - ফলো-থ্রু সম্ভব")
+        text = text.replace("DOWN - follow-through needed", "ডাউন - ফলো-থ্রু প্রয়োজন")
+        text = text.replace("Squeeze High:", "স্কুইজ হাই:")
+        text = text.replace("Flush Low:", "ফ্লাশ লো:")
+        text = text.replace("BUY only on close above", "শুধুমাত্র উপরে ক্লোজ হলে কিনুন")
+        text = text.replace("SELL only on close below", "শুধুমাত্র নিচে ক্লোজ হলে বিক্রি করুন")
+        text = text.replace("Buy confirmed above", "উপরে কেনা নিশ্চিত")
+        text = text.replace("Sell confirmed below", "নিচে বিক্রি নিশ্চিত")
+        text = text.replace("Buy only above", "শুধুমাত্র উপরে কিনুন")
+        text = text.replace("Sell only below", "শুধুমাত্র নিচে বিক্রি করুন")
+        text = text.replace("Price failed the bullish reversal setup", "দাম বুলিশ রিভার্সাল সেটআপে ব্যর্থ হয়েছে")
+        text = text.replace("Price failed the bearish reversal setup", "দাম বিয়ারিশ রিভার্সাল সেটআপে ব্যর্থ হয়েছে")
+        text = text.replace("DOWN / CONTINUATION RISK", "ডাউন / ধারাবাহিকতার ঝুঁকি")
+        text = text.replace("UP / CONTINUATION RISK", "আপ / ধারাবাহিকতার ঝুঁকি")
+        return text
+
+    english_msg = (
         header +
-        f"{title}\n"
-        f"{detail}\n"
-        f"Bias: {bias} · Score: {score}\n"
-        f"⌛ GET READY - {next_text}\n"
-        f"❌ Wrong if close {invalid}\n"
-        f"Next: {next_text}\n"
-        f"{level}\n"
-        f"{confirm}\n"
+        f"{title_en}\n"
+        f"{detail_en}\n"
+        f"Bias: {bias_en} · Score: {score_en}\n"
+        f"⌛ GET READY - {next_text_en}\n"
+        f"❌ Wrong if close {invalid_en}\n"
+        f"Next: {next_text_en}\n"
+        f"{level_en}\n"
+        f"{confirm_en}\n"
         f"V {format_volume(row['vol'])} · Δ {format_delta(row['delta'])} · OI {format_delta(row['oi_delta'])}"
     )
+
+    hindi_msg = translate_to_hi(english_msg)
+    bengali_msg = translate_to_bn(english_msg)
+
+    final_msg = (
+        f"[ENGLISH]\n{english_msg}\n\n"
+        f"[HINDI]\n{hindi_msg}\n\n"
+        f"[BENGALI]\n{bengali_msg}"
+    )
+    return final_msg
 
 def build_moneyflow_tooltip(row, signal_type, timeframe, candle_time):
     time_str = to_indian_time(candle_time)
     header = f"🕐 {timeframe} | {time_str}\n"
 
+    # English base
     if signal_type == "SELLER_EXIT":
-        title = "⚫ SELLER EXIT"
-        detail = f"Price: {row['close']:.1f}"
-        flow = "Flow: Buyers stronger"
-        exit_text = "Exit: Sellers Exiting"
-        oi_line = f"OI Change: {format_delta(row['oi_delta'])}"
-        return header + f"{title}\n{detail}\n{flow}\n{oi_line}\n{exit_text}\n"
+        title_en = "⚫ SELLER EXIT"
+        detail_en = f"Price: {row['close']:.1f}"
+        flow_en = "Flow: Buyers stronger"
+        exit_en = "Exit: Sellers Exiting"
+        oi_en = f"OI Change: {format_delta(row['oi_delta'])}"
+        english_msg = header + f"{title_en}\n{detail_en}\n{flow_en}\n{oi_en}\n{exit_en}\n"
     elif signal_type == "BUYER_EXIT":
-        title = "⚫ BUYER EXIT"
-        detail = f"Price: {row['close']:.1f}"
-        flow = "Flow: Sellers Stronger"
-        exit_text = "Exit: Buyer Exiting"
-        oi_line = f"OI Change: {format_delta(row['oi_delta'])}"
-        return header + f"{title}\n{detail}\n{flow}\n{oi_line}\n{exit_text}\n"
-
-    if signal_type == "NEW_BUYERS":
-        title = "🟢 NEW BUYERS ENTRY"
-        detail = f"Price: {row['close']:.1f}"
-    elif signal_type == "NEW_SELLERS":
-        title = "🔴 NEW SELLERS ENTRY"
-        detail = f"Price: {row['close']:.1f}"
-    elif signal_type == "BULLISH_FLOW":
-        title = "🟢 BULLISH MONEY FLOW"
-        detail = f"Price: {row['close']:.1f}"
-    elif signal_type == "BEARISH_FLOW":
-        title = "🔴 BEARISH MONEY FLOW"
-        detail = f"Price: {row['close']:.1f}"
-    elif signal_type == "BULLISH_DIVERGENCE":
-        title = "🟢 OI DIVERGENCE - BULLISH"
-        detail = f"Price: {row['close']:.1f}"
-    elif signal_type == "BEARISH_DIVERGENCE":
-        title = "🔴 OI DIVERGENCE - BEARISH"
-        detail = f"Price: {row['close']:.1f}"
-    elif signal_type == "TRAPPED_BUYERS":
-        title = "⚠️ TRAPPED BUYERS"
-        detail = f"Price: {row['close']:.1f}"
-    elif signal_type == "TRAPPED_SELLERS":
-        title = "⚠️ TRAPPED SELLERS"
-        detail = f"Price: {row['close']:.1f}"
+        title_en = "⚫ BUYER EXIT"
+        detail_en = f"Price: {row['close']:.1f}"
+        flow_en = "Flow: Sellers Stronger"
+        exit_en = "Exit: Buyer Exiting"
+        oi_en = f"OI Change: {format_delta(row['oi_delta'])}"
+        english_msg = header + f"{title_en}\n{detail_en}\n{flow_en}\n{oi_en}\n{exit_en}\n"
     else:
-        return ""
+        if signal_type == "NEW_BUYERS":
+            title_en = "🟢 NEW BUYERS ENTRY"
+            detail_en = f"Price: {row['close']:.1f}"
+        elif signal_type == "NEW_SELLERS":
+            title_en = "🔴 NEW SELLERS ENTRY"
+            detail_en = f"Price: {row['close']:.1f}"
+        elif signal_type == "BULLISH_FLOW":
+            title_en = "🟢 BULLISH MONEY FLOW"
+            detail_en = f"Price: {row['close']:.1f}"
+        elif signal_type == "BEARISH_FLOW":
+            title_en = "🔴 BEARISH MONEY FLOW"
+            detail_en = f"Price: {row['close']:.1f}"
+        elif signal_type == "BULLISH_DIVERGENCE":
+            title_en = "🟢 OI DIVERGENCE - BULLISH"
+            detail_en = f"Price: {row['close']:.1f}"
+        elif signal_type == "BEARISH_DIVERGENCE":
+            title_en = "🔴 OI DIVERGENCE - BEARISH"
+            detail_en = f"Price: {row['close']:.1f}"
+        elif signal_type == "TRAPPED_BUYERS":
+            title_en = "⚠️ TRAPPED BUYERS"
+            detail_en = f"Price: {row['close']:.1f}"
+        elif signal_type == "TRAPPED_SELLERS":
+            title_en = "⚠️ TRAPPED SELLERS"
+            detail_en = f"Price: {row['close']:.1f}"
+        else:
+            return ""
 
-    buy_sell_vol = f"Buy Volume: {format_volume(row['buy_volume'])} · Sell Volume: {format_volume(row['sell_volume'])}"
-    oi_line = f"OI Change: {format_delta(row['oi_delta'])}"
+        buy_sell_en = f"Buy Volume: {format_volume(row['buy_volume'])} · Sell Volume: {format_volume(row['sell_volume'])}"
+        oi_en = f"OI Change: {format_delta(row['oi_delta'])}"
+        english_msg = (
+            header +
+            f"{title_en}\n"
+            f"{detail_en}\n"
+            f"{flow_text_en(row)}\n"
+            f"{net_flow_text_en(row)}\n"
+            f"{buy_sell_en}\n"
+            f"{oi_en}\n"
+            f"{trap_exit_text_en(row)}\n"
+        )
 
-    return (
-        header +
-        f"{title}\n"
-        f"{detail}\n"
-        f"{flow_text(row)}\n"
-        f"{net_flow_text(row)}\n"
-        f"{buy_sell_vol}\n"
-        f"{oi_line}\n"
-        f"{trap_exit_text(row)}\n"
+    # Hindi
+    def translate_to_hi(text):
+        text = text.replace("SELLER EXIT", "सेलर एग्ज़िट")
+        text = text.replace("BUYER EXIT", "बायर एग्ज़िट")
+        text = text.replace("NEW BUYERS ENTRY", "नए खरीदार प्रवेश")
+        text = text.replace("NEW SELLERS ENTRY", "नए विक्रेता प्रवेश")
+        text = text.replace("BULLISH MONEY FLOW", "बुलिश मनी फ्लो")
+        text = text.replace("BEARISH MONEY FLOW", "बेयरिश मनी फ्लो")
+        text = text.replace("OI DIVERGENCE - BULLISH", "OI डाइवर्जेंस - बुलिश")
+        text = text.replace("OI DIVERGENCE - BEARISH", "OI डाइवर्जेंस - बेयरिश")
+        text = text.replace("TRAPPED BUYERS", "फंसे खरीदार")
+        text = text.replace("TRAPPED SELLERS", "फंसे विक्रेता")
+        text = text.replace("Price:", "कीमत:")
+        text = text.replace("Flow: Buyers stronger", "प्रवाह: खरीदार मजबूत")
+        text = text.replace("Flow: Sellers Stronger", "प्रवाह: विक्रेता मजबूत")
+        text = text.replace("Exit: Sellers Exiting", "एग्ज़िट: विक्रेता बाहर")
+        text = text.replace("Exit: Buyer Exiting", "एग्ज़िट: खरीदार बाहर")
+        text = text.replace("OI Change:", "OI बदलाव:")
+        text = text.replace("Buy Volume:", "खरीद मात्रा:")
+        text = text.replace("Sell Volume:", "बिक्री मात्रा:")
+        text = text.replace("Net Buyer:", "नेट खरीदार:")
+        text = text.replace("Net Seller:", "नेट विक्रेता:")
+        text = text.replace("Trap / Force Exit:", "ट्रैप / फोर्स एग्ज़िट:")
+        text = text.replace("Buyers trapped", "खरीदार फंसे")
+        text = text.replace("Sellers trapped", "विक्रेता फंसे")
+        text = text.replace("Exit: Buyers exiting", "एग्ज़िट: खरीदार बाहर")
+        text = text.replace("Exit: Sellers exiting", "एग्ज़िट: विक्रेता बाहर")
+        return text
+
+    # Bengali
+    def translate_to_bn(text):
+        text = text.replace("SELLER EXIT", "সেলার এক্সিট")
+        text = text.replace("BUYER EXIT", "বায়ার এক্সিট")
+        text = text.replace("NEW BUYERS ENTRY", "নতুন ক্রেতা প্রবেশ")
+        text = text.replace("NEW SELLERS ENTRY", "নতুন বিক্রেতা প্রবেশ")
+        text = text.replace("BULLISH MONEY FLOW", "বুলিশ মানি ফ্লো")
+        text = text.replace("BEARISH MONEY FLOW", "বিয়ারিশ মানি ফ্লো")
+        text = text.replace("OI DIVERGENCE - BULLISH", "OI ডাইভারজেন্স - বুলিশ")
+        text = text.replace("OI DIVERGENCE - BEARISH", "OI ডাইভারজেন্স - বিয়ারিশ")
+        text = text.replace("TRAPPED BUYERS", "আটকে পড়া ক্রেতা")
+        text = text.replace("TRAPPED SELLERS", "আটকে পড়া বিক্রেতা")
+        text = text.replace("Price:", "মূল্য:")
+        text = text.replace("Flow: Buyers stronger", "প্রবাহ: ক্রেতারা শক্তিশালী")
+        text = text.replace("Flow: Sellers Stronger", "প্রবাহ: বিক্রেতারা শক্তিশালী")
+        text = text.replace("Exit: Sellers Exiting", "এক্সিট: বিক্রেতারা বেরিয়ে যাচ্ছে")
+        text = text.replace("Exit: Buyer Exiting", "এক্সিট: ক্রেতারা বেরিয়ে যাচ্ছে")
+        text = text.replace("OI Change:", "OI পরিবর্তন:")
+        text = text.replace("Buy Volume:", "ক্রয় ভলিউম:")
+        text = text.replace("Sell Volume:", "বিক্রয় ভলিউম:")
+        text = text.replace("Net Buyer:", "নেট ক্রেতা:")
+        text = text.replace("Net Seller:", "নেট বিক্রেতা:")
+        text = text.replace("Trap / Force Exit:", "ট্র্যাপ / ফোর্স এক্সিট:")
+        text = text.replace("Buyers trapped", "ক্রেতারা আটকা পড়েছে")
+        text = text.replace("Sellers trapped", "বিক্রেতারা আটকা পড়েছে")
+        text = text.replace("Exit: Buyers exiting", "এক্সিট: ক্রেতারা বেরিয়ে যাচ্ছে")
+        text = text.replace("Exit: Sellers exiting", "এক্সিট: বিক্রেতারা বেরিয়ে যাচ্ছে")
+        return text
+
+    hindi_msg = translate_to_hi(english_msg)
+    bengali_msg = translate_to_bn(english_msg)
+
+    final_msg = (
+        f"[ENGLISH]\n{english_msg}\n\n"
+        f"[HINDI]\n{hindi_msg}\n\n"
+        f"[BENGALI]\n{bengali_msg}"
     )
+    return final_msg
 
 # ============ TELEGRAM SENDER ============
 def send_telegram_sync(text):
