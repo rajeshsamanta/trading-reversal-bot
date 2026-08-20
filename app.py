@@ -14,7 +14,7 @@ from collections import defaultdict
 sys.stdout.reconfigure(line_buffering=True)
 
 # ============ CONFIGURATION ============
-TELEGRAM_TOKEN = "8776819788:AAHfoFM_82byoGtR3q6jB0PKHw5S45GBqJI"          # <-- আপনার নতুন Bot Token বসান
+TELEGRAM_TOKEN = "8776819788:AAHfoFM_82byoGtR3q6jB0PKHw5S45GBqJI"          # <-- এখানে আপনার Bot Token বসান
 CHAT_ID = "-1003988993524"                 # আপনার Channel Chat ID
 
 SYMBOL = "BTC-USDT-SWAP"
@@ -25,7 +25,6 @@ LOWER_LIMIT = 1000
 VOLUME_LOOKBACK = 50
 OI_LOOKBACK = 42
 
-# Reversal data inputs (Bull unchanged)
 REVERSAL_IMPULSE_LOOKBACK = 12
 REVERSAL_MIN_IMPULSE = 1000.0
 REVERSAL_SWING_LOOKBACK = 8
@@ -34,37 +33,30 @@ REVERSAL_DELTA_SHARE_THRESHOLD = 0.25
 REVERSAL_OI_MULTIPLIER = 1.0
 REVERSAL_MINIMUM_SCORE = 4
 
-# BEAR REVERSAL-এর জন্য 5% strict multiplier
 BEAR_REVERSAL_MIN_IMPULSE = 1050.0
 BEAR_REVERSAL_VOLUME_MULTIPLIER = 1.575
 BEAR_REVERSAL_DELTA_SHARE_THRESHOLD = 0.2625
 BEAR_REVERSAL_OI_MULTIPLIER = 1.05
 
-# Money Flow thresholds (Bull/Bear shift)
 DEEP_BLUE_VOLUME_MULT = 3.0
 DEEP_BLUE_DELTA_SHARE = 0.35
 
-# New Buyers / New Sellers (Green Dot) - 25% + 10% = total 35% increase from base
-OI_ENTRY_MULT = 2.06                 
+OI_ENTRY_MULT = 2.06
 OI_BUILD_MIN_ABS_15M = 151.2
 
-# Black Dot (Buyers/Sellers Exiting) - 5% + 10% = total 15% increase from base
-OI_EXIT_MULT = 1.27                  
+OI_EXIT_MULT = 1.27
 OI_EXIT_MIN_ABS_15M = 152.5
 
 DIVERGENCE_EVENT_MULT = 1.2
 
-# TRAPPED BUYERS/SELLERS-এর জন্য strict thresholds (A+B+C)
 TRAPPED_OI_MULT = 1.05
 TRAPPED_VOLUME_MULT = 1.05
 TRAPPED_DELTA_SHARE_MIN = 0.05
 
-# POC Settings
 POC_BIN_SIZE = 1.0
 POC_TIE_BREAK = "Latest"
 
 IN_TZ = ZoneInfo("Asia/Kolkata")
-
 poc_sent = set()
 
 def to_indian_time(ms):
@@ -75,7 +67,6 @@ def to_indian_time(ms):
 
 # ============ OKX API ============
 def get_market_klines(instId, bar, limit):
-    """OKX Futures klines"""
     url = "https://www.okx.com/api/v5/market/candles"
     params = {"instId": instId, "bar": bar, "limit": str(limit)}
     try:
@@ -95,8 +86,48 @@ def get_market_klines(instId, bar, limit):
         print(f"Error fetching OKX klines: {e}")
         return None
 
+def get_1m_candles_range(start_ms, end_ms):
+    url = "https://www.okx.com/api/v5/market/history-candles"
+    all_candles = []
+    cursor = str(end_ms)
+    while True:
+        params = {
+            "instId": SYMBOL,
+            "bar": "1m",
+            "limit": "1000",
+            "before": cursor,
+        }
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            data = resp.json()
+            if data.get("code") != "0":
+                print(f"History candles error: {data}")
+                break
+            rows = data["data"]
+            if not rows:
+                break
+            for r in rows:
+                ts = int(r[0])
+                if ts < start_ms:
+                    break
+                all_candles.append(r)
+            earliest_ts = int(rows[-1][0])
+            if earliest_ts <= start_ms or len(rows) < 1000:
+                break
+            cursor = str(earliest_ts)
+        except Exception as e:
+            print(f"Error fetching 1m history: {e}")
+            break
+
+    if not all_candles:
+        return None
+    df = pd.DataFrame(all_candles, columns=["time", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"])
+    for col in ["open", "high", "low", "close", "vol"]:
+        df[col] = df[col].astype(float)
+    df = df.sort_values("time").reset_index(drop=True)
+    return df
+
 def get_oi_history(bar, limit):
-    """OKX Open Interest history"""
     url = "https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-history"
     params = {"instId": SYMBOL, "period": bar, "limit": str(limit)}
     try:
@@ -161,11 +192,10 @@ def calculate_delta(df_main):
     df_main["delta_share"] = abs(df_main["delta"]) / df_main["vol"].clip(lower=1)
     return df_main
 
-# ============ POC CALCULATION (Exact Pine Script Logic) ============
+# ============ POC CALCULATION ============
 def compute_poc_from_1m(candles, start_ms, end_ms):
     if candles is None or len(candles) == 0:
         return None
-
     df = candles.copy()
     df["time_ms"] = df["time"].astype(int)
     mask = (df["time_ms"] >= start_ms) & (df["time_ms"] < end_ms)
@@ -189,7 +219,7 @@ def compute_poc_from_1m(candles, start_ms, end_ms):
     best_bin = max(max_bins) if POC_TIE_BREAK == "Latest" else max(max_bins)
     return best_bin * step
 
-# ============ POC ALERTS (Three languages) ============
+# ============ POC ALERTS ============
 def check_poc_alerts():
     global poc_sent
     now = datetime.now(IN_TZ)
@@ -220,44 +250,33 @@ def check_poc_alerts():
         return
 
     for session, types in grouped.items():
-        candles = get_market_klines(SYMBOL, "1m", 500)
+        if "WEEKLY" in types:
+            start_ms = int((session - timedelta(days=7)).timestamp() * 1000)
+        elif "DAILY" in types:
+            start_ms = int((session - timedelta(days=1)).timestamp() * 1000)
+        else:
+            start_ms = int((session - timedelta(hours=4)).timestamp() * 1000)
+
+        end_ms = int(session.timestamp() * 1000)
+        candles = get_1m_candles_range(start_ms, end_ms)
         if candles is None:
             continue
 
-        start_ms = int(session.timestamp() * 1000)
-        end_ms = int((session + timedelta(minutes=5)).timestamp() * 1000)
-
-        lines_en, lines_hi, lines_bn = [], [], []
+        lines = []
         for ptype in types:
             poc = compute_poc_from_1m(candles, start_ms, end_ms)
             if poc is not None:
                 color_map = {"WEEKLY": "🟠", "DAILY": "🔵", "4H": "🩵"}
                 color = color_map.get(ptype, "⚪")
-                label_en = f"{color} {ptype} POC: ${poc:,.2f}"
-                label_hi = f"{color} {ptype} POC: ${poc:,.2f}"
-                label_bn = f"{color} {ptype} POC: ${poc:,.2f}"
-                lines_en.append(label_en)
-                lines_hi.append(label_hi)
-                lines_bn.append(label_bn)
+                label = f"{color} {ptype} POC: ${poc:,.2f}"
+                lines.append(label)
 
-        if lines_en:
+        if lines:
             msg = f"🕐 {session.strftime('%I:%M %p')} | {session.strftime('%Y-%m-%d')}\n"
-            msg += "[ENGLISH]\n"
-            for label in lines_en:
-                msg += "━━━━━━━━━━━━━━━\n"
-                msg += label + "\n"
-            msg += "━━━━━━━━━━━━━━━\n\n"
-            msg += "[HINDI]\n"
-            for label in lines_hi:
-                msg += "━━━━━━━━━━━━━━━\n"
-                msg += label + "\n"
-            msg += "━━━━━━━━━━━━━━━\n\n"
-            msg += "[BENGALI]\n"
-            for label in lines_bn:
+            for label in lines:
                 msg += "━━━━━━━━━━━━━━━\n"
                 msg += label + "\n"
             msg += "━━━━━━━━━━━━━━━"
-
             try:
                 send_telegram_sync(msg)
                 print(f"✅ Sent POC alert for {session.strftime('%Y-%m-%d %H:%M')}")
@@ -362,11 +381,15 @@ def calculate_signals(df):
     df["oi_entry_move_ok"] = (df["oi_delta"].abs() >= df["oi_abs_base"] * OI_ENTRY_MULT) & (df["oi_delta"].abs() >= OI_BUILD_MIN_ABS_15M)
     df["oi_exit_move_ok"] = (df["oi_delta"].abs() >= df["oi_abs_base"] * OI_EXIT_MULT) & (df["oi_delta"].abs() >= OI_EXIT_MIN_ABS_15M)
 
+    # নতুন volume condition: আগের candle-এর volume-এর চেয়ে বেশি
+    df["vol_greater_than_prev"] = df["vol"] > df["vol"].shift(1)
+
     df["new_buyers_raw"] = df["oi_entry_move_ok"] & df["oi_increase"] & df["candle_up"]
     df["new_sellers_raw"] = df["oi_entry_move_ok"] & df["oi_increase"] & df["candle_down"]
 
-    df["buyers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_down"]
-    df["sellers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_up"]
+    # Black dot: volume_greater_than_prev যোগ করা হলো
+    df["buyers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_down"] & df["vol_greater_than_prev"]
+    df["sellers_exiting_raw"] = df["oi_exit_move_ok"] & df["oi_decrease"] & df["candle_up"] & df["vol_greater_than_prev"]
 
     df["trapped_buyers_raw"] = (
         df["candle_up"] &
@@ -536,12 +559,11 @@ def trap_exit_text_bn(row):
         parts.append("এক্সিট: বিক্রেতারা বেরিয়ে যাচ্ছে")
     return " | ".join(parts) if parts else "ট্র্যাপ / ফোর্স এক্সিট: কেউ না"
 
-# ============ MESSAGE BUILDERS (Three languages) ============
+# ============ MESSAGE BUILDERS ============
 def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
     time_str = to_indian_time(candle_time)
     header = f"🕐 {timeframe} | {time_str}\n"
 
-    # English
     if signal_type == "SHORT_COVER":
         title_en = f"SHORT COVER [{strength_text(row['short_cover_score'], 4)}]"
         detail_en = "Shorts buying back"
@@ -617,8 +639,19 @@ def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
     else:
         return ""
 
-    # Hindi and Bengali via replacement of common phrases (simplified)
-    # We'll use basic translate function
+    english_msg = (
+        header +
+        f"{title_en}\n"
+        f"{detail_en}\n"
+        f"Bias: {bias_en} · Score: {score_en}\n"
+        f"⌛ GET READY - {next_text_en}\n"
+        f"❌ Wrong if close {invalid_en}\n"
+        f"Next: {next_text_en}\n"
+        f"{level_en}\n"
+        f"{confirm_en}\n"
+        f"V {format_volume(row['vol'])} · Δ {format_delta(row['delta'])} · OI {format_delta(row['oi_delta'])}"
+    )
+
     def translate_to_hi(text):
         text = text.replace("SHORT COVER", "शॉर्ट कवर")
         text = text.replace("LONG LIQUIDATION", "लॉन्ग लिक्विडेशन")
@@ -643,10 +676,6 @@ def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
         text = text.replace("Sell confirmed below", "नीचे बिक्री की पुष्टि")
         text = text.replace("Buy only above", "केवल ऊपर खरीदें")
         text = text.replace("Sell only below", "केवल नीचे बेचें")
-        text = text.replace("Price failed the bullish reversal setup", "कीमत बुलिश रिवर्सल सेटअप में विफल रही")
-        text = text.replace("Price failed the bearish reversal setup", "कीमत बेयरिश रिवर्सल सेटअप में विफल रही")
-        text = text.replace("DOWN / CONTINUATION RISK", "नीचे / निरंतरता जोखिम")
-        text = text.replace("UP / CONTINUATION RISK", "ऊपर / निरंतरता जोखिम")
         return text
 
     def translate_to_bn(text):
@@ -673,40 +702,16 @@ def build_reversal_tooltip(row, signal_type, timeframe, candle_time):
         text = text.replace("Sell confirmed below", "নিচে বিক্রি নিশ্চিত")
         text = text.replace("Buy only above", "শুধুমাত্র উপরে কিনুন")
         text = text.replace("Sell only below", "শুধুমাত্র নিচে বিক্রি করুন")
-        text = text.replace("Price failed the bullish reversal setup", "দাম বুলিশ রিভার্সাল সেটআপে ব্যর্থ হয়েছে")
-        text = text.replace("Price failed the bearish reversal setup", "দাম বিয়ারিশ রিভার্সাল সেটআপে ব্যর্থ হয়েছে")
-        text = text.replace("DOWN / CONTINUATION RISK", "ডাউন / ধারাবাহিকতার ঝুঁকি")
-        text = text.replace("UP / CONTINUATION RISK", "আপ / ধারাবাহিকতার ঝুঁকি")
         return text
-
-    english_msg = (
-        header +
-        f"{title_en}\n"
-        f"{detail_en}\n"
-        f"Bias: {bias_en} · Score: {score_en}\n"
-        f"⌛ GET READY - {next_text_en}\n"
-        f"❌ Wrong if close {invalid_en}\n"
-        f"Next: {next_text_en}\n"
-        f"{level_en}\n"
-        f"{confirm_en}\n"
-        f"V {format_volume(row['vol'])} · Δ {format_delta(row['delta'])} · OI {format_delta(row['oi_delta'])}"
-    )
 
     hindi_msg = translate_to_hi(english_msg)
     bengali_msg = translate_to_bn(english_msg)
-
-    final_msg = (
-        f"[ENGLISH]\n{english_msg}\n\n"
-        f"[HINDI]\n{hindi_msg}\n\n"
-        f"[BENGALI]\n{bengali_msg}"
-    )
-    return final_msg
+    return f"[ENGLISH]\n{english_msg}\n\n[HINDI]\n{hindi_msg}\n\n[BENGALI]\n{bengali_msg}"
 
 def build_moneyflow_tooltip(row, signal_type, timeframe, candle_time):
     time_str = to_indian_time(candle_time)
     header = f"🕐 {timeframe} | {time_str}\n"
 
-    # English base
     if signal_type == "SELLER_EXIT":
         title_en = "⚫ SELLER EXIT"
         detail_en = f"Price: {row['close']:.1f}"
@@ -724,28 +729,20 @@ def build_moneyflow_tooltip(row, signal_type, timeframe, candle_time):
     else:
         if signal_type == "NEW_BUYERS":
             title_en = "🟢 NEW BUYERS ENTRY"
-            detail_en = f"Price: {row['close']:.1f}"
         elif signal_type == "NEW_SELLERS":
             title_en = "🔴 NEW SELLERS ENTRY"
-            detail_en = f"Price: {row['close']:.1f}"
         elif signal_type == "BULLISH_FLOW":
             title_en = "🟢 BULLISH MONEY FLOW"
-            detail_en = f"Price: {row['close']:.1f}"
         elif signal_type == "BEARISH_FLOW":
             title_en = "🔴 BEARISH MONEY FLOW"
-            detail_en = f"Price: {row['close']:.1f}"
         elif signal_type == "BULLISH_DIVERGENCE":
             title_en = "🟢 OI DIVERGENCE - BULLISH"
-            detail_en = f"Price: {row['close']:.1f}"
         elif signal_type == "BEARISH_DIVERGENCE":
             title_en = "🔴 OI DIVERGENCE - BEARISH"
-            detail_en = f"Price: {row['close']:.1f}"
         elif signal_type == "TRAPPED_BUYERS":
             title_en = "⚠️ TRAPPED BUYERS"
-            detail_en = f"Price: {row['close']:.1f}"
         elif signal_type == "TRAPPED_SELLERS":
             title_en = "⚠️ TRAPPED SELLERS"
-            detail_en = f"Price: {row['close']:.1f}"
         else:
             return ""
 
@@ -754,7 +751,7 @@ def build_moneyflow_tooltip(row, signal_type, timeframe, candle_time):
         english_msg = (
             header +
             f"{title_en}\n"
-            f"{detail_en}\n"
+            f"Price: {row['close']:.1f}\n"
             f"{flow_text_en(row)}\n"
             f"{net_flow_text_en(row)}\n"
             f"{buy_sell_en}\n"
@@ -762,7 +759,6 @@ def build_moneyflow_tooltip(row, signal_type, timeframe, candle_time):
             f"{trap_exit_text_en(row)}\n"
         )
 
-    # Hindi
     def translate_to_hi(text):
         text = text.replace("SELLER EXIT", "सेलर एग्ज़िट")
         text = text.replace("BUYER EXIT", "बायर एग्ज़िट")
@@ -784,14 +780,8 @@ def build_moneyflow_tooltip(row, signal_type, timeframe, candle_time):
         text = text.replace("Sell Volume:", "बिक्री मात्रा:")
         text = text.replace("Net Buyer:", "नेट खरीदार:")
         text = text.replace("Net Seller:", "नेट विक्रेता:")
-        text = text.replace("Trap / Force Exit:", "ट्रैप / फोर्स एग्ज़िट:")
-        text = text.replace("Buyers trapped", "खरीदार फंसे")
-        text = text.replace("Sellers trapped", "विक्रेता फंसे")
-        text = text.replace("Exit: Buyers exiting", "एग्ज़िट: खरीदार बाहर")
-        text = text.replace("Exit: Sellers exiting", "एग्ज़िट: विक्रेता बाहर")
         return text
 
-    # Bengali
     def translate_to_bn(text):
         text = text.replace("SELLER EXIT", "সেলার এক্সিট")
         text = text.replace("BUYER EXIT", "বায়ার এক্সিট")
@@ -813,22 +803,11 @@ def build_moneyflow_tooltip(row, signal_type, timeframe, candle_time):
         text = text.replace("Sell Volume:", "বিক্রয় ভলিউম:")
         text = text.replace("Net Buyer:", "নেট ক্রেতা:")
         text = text.replace("Net Seller:", "নেট বিক্রেতা:")
-        text = text.replace("Trap / Force Exit:", "ট্র্যাপ / ফোর্স এক্সিট:")
-        text = text.replace("Buyers trapped", "ক্রেতারা আটকা পড়েছে")
-        text = text.replace("Sellers trapped", "বিক্রেতারা আটকা পড়েছে")
-        text = text.replace("Exit: Buyers exiting", "এক্সিট: ক্রেতারা বেরিয়ে যাচ্ছে")
-        text = text.replace("Exit: Sellers exiting", "এক্সিট: বিক্রেতারা বেরিয়ে যাচ্ছে")
         return text
 
     hindi_msg = translate_to_hi(english_msg)
     bengali_msg = translate_to_bn(english_msg)
-
-    final_msg = (
-        f"[ENGLISH]\n{english_msg}\n\n"
-        f"[HINDI]\n{hindi_msg}\n\n"
-        f"[BENGALI]\n{bengali_msg}"
-    )
-    return final_msg
+    return f"[ENGLISH]\n{english_msg}\n\n[HINDI]\n{hindi_msg}\n\n[BENGALI]\n{bengali_msg}"
 
 # ============ TELEGRAM SENDER ============
 def send_telegram_sync(text):
@@ -876,7 +855,6 @@ def check_and_alert():
     else:
         messages = []
 
-        # Reversal signals
         if row["short_cover"]:
             messages.append(build_reversal_tooltip(row, "SHORT_COVER", TIMEFRAME, candle_time))
         if row["long_liq"]:
@@ -886,7 +864,6 @@ def check_and_alert():
         if row["bear_reversal_candidate"]:
             messages.append(build_reversal_tooltip(row, "BEAR_REVERSAL", TIMEFRAME, candle_time))
 
-        # Confirmed / Failed
         if row["bull_confirmed"]:
             messages.append(build_reversal_tooltip(row, "CONFIRMED_BULL", TIMEFRAME, candle_time))
         if row["bear_confirmed"]:
@@ -896,7 +873,6 @@ def check_and_alert():
         if row["bear_failed"]:
             messages.append(build_reversal_tooltip(row, "BEAR_FAILED", TIMEFRAME, candle_time))
 
-        # Money flow signals
         if row["new_buyers_raw"]:
             messages.append(build_moneyflow_tooltip(row, "NEW_BUYERS", TIMEFRAME, candle_time))
         if row["new_sellers_raw"]:
@@ -910,13 +886,11 @@ def check_and_alert():
         if row["bear_shift_raw"]:
             messages.append(build_moneyflow_tooltip(row, "BEARISH_FLOW", TIMEFRAME, candle_time))
 
-        # OI Divergence
         if row["bullish_divergence"]:
             messages.append(build_moneyflow_tooltip(row, "BULLISH_DIVERGENCE", TIMEFRAME, candle_time))
         if row["bearish_divergence"]:
             messages.append(build_moneyflow_tooltip(row, "BEARISH_DIVERGENCE", TIMEFRAME, candle_time))
 
-        # Trapped
         if row["trapped_buyers_raw"]:
             messages.append(build_moneyflow_tooltip(row, "TRAPPED_BUYERS", TIMEFRAME, candle_time))
         if row["trapped_sellers_raw"]:
@@ -934,7 +908,6 @@ def check_and_alert():
         else:
             print("No signals on this candle.")
 
-    # POC alerts
     check_poc_alerts()
 
 # ============ FLASK APP ============
