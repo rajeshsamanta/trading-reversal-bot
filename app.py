@@ -960,10 +960,14 @@ def check_compression_alerts():
             if None in (weekly_poc, daily_poc, four_hour_poc):
                 continue
 
-            close = candle["close"]
-            if close > weekly_poc and close > daily_poc and close > four_hour_poc:
+            open_price = candle["open"]
+            close_price = candle["close"]
+
+            if (open_price < weekly_poc and open_price < daily_poc and open_price < four_hour_poc and
+                close_price > weekly_poc and close_price > daily_poc and close_price > four_hour_poc):
                 direction = "Bullish Cross"
-            elif close < weekly_poc and close < daily_poc and close < four_hour_poc:
+            elif (open_price > weekly_poc and open_price > daily_poc and open_price > four_hour_poc and
+                  close_price < weekly_poc and close_price < daily_poc and close_price < four_hour_poc):
                 direction = "Bearish Cross"
             else:
                 continue
