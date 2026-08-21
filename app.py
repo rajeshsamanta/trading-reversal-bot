@@ -90,21 +90,27 @@ def get_market_klines(instId, bar, limit):
         return None
 
 def get_1m_candles_range(start_ms, end_ms):
-    url = "https://www.okx.com/api/v5/market/history-candles"
+    """
+    OKX /market/candles থেকে 1m candles আনে (recent data),
+    pagination দিয়ে যতগুলো দরকার।
+    """
+    url = "https://www.okx.com/api/v5/market/candles"
     all_candles = []
-    cursor = str(end_ms)
+    cursor = None
     while True:
         params = {
             "instId": SYMBOL,
             "bar": "1m",
-            "limit": "100",
-            "before": cursor,
+            "limit": "300",
         }
+        if cursor is not None:
+            params["before"] = str(cursor)
+
         try:
             resp = requests.get(url, params=params, timeout=15)
             data = resp.json()
             if data.get("code") != "0":
-                print(f"History candles error: {data}")
+                print(f"OKX 1m market candles error: {data}")
                 break
             rows = data.get("data", [])
             if not rows:
@@ -115,11 +121,11 @@ def get_1m_candles_range(start_ms, end_ms):
                     break
                 all_candles.append(r)
             earliest_ts = int(rows[-1][0])
-            if earliest_ts <= start_ms or len(rows) < 100:
+            if earliest_ts <= start_ms or len(rows) < 300:
                 break
-            cursor = str(earliest_ts)
+            cursor = earliest_ts
         except Exception as e:
-            print(f"Error fetching 1m history: {e}")
+            print(f"Error fetching 1m market candles: {e}")
             break
 
     if not all_candles:
