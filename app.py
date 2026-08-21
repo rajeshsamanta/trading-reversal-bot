@@ -62,6 +62,22 @@ IN_TZ = ZoneInfo("Asia/Kolkata")
 poc_sent = set()
 compression_sent = set()
 
+# POC State per market
+poc_state = {
+    "OKX": {
+        "weekly": None,
+        "daily": None,
+        "four_hour": None,
+        "four_hour_session": None,
+    },
+    "CME": {
+        "weekly": None,
+        "daily": None,
+        "four_hour": None,
+        "four_hour_session": None,
+    }
+}
+
 def to_indian_time(ms):
     if ms:
         return datetime.fromtimestamp(int(ms) / 1000, tz=IN_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -90,10 +106,6 @@ def get_market_klines(instId, bar, limit):
         return None
 
 def get_1m_candles_range(start_ms, end_ms):
-    """
-    OKX /market/candles থেকে 1m candles আনে (recent data),
-    pagination দিয়ে যতগুলো দরকার।
-    """
     url = "https://www.okx.com/api/v5/market/candles"
     all_candles = []
     cursor = None
@@ -320,72 +332,136 @@ def compute_poc_from_df(df_candles, start_ms, end_ms):
     best_bin = max(max_bins) if POC_TIE_BREAK == "Latest" else max(max_bins)
     return best_bin * step
 
-# ============ POC ALERTS ============
-def check_poc_alerts():
-    global poc_sent
-    now = datetime.now(IN_TZ)
-    due_sessions = []
-
+# ============ SESSION TIME HELPERS ============
+def get_okx_session_times(now):
+    sessions = []
+    # Weekly Monday 5:30
     if now.weekday() == 0:
         session = now.replace(hour=5, minute=30, second=0, microsecond=0)
         if 0 <= (now - session).total_seconds() <= 15 * 60:
-            due_sessions.append(("WEEKLY", session))
-
+            sessions.append(("WEEKLY", session, "OKX"))
+    # Daily 5:30
     session = now.replace(hour=5, minute=30, second=0, microsecond=0)
     if 0 <= (now - session).total_seconds() <= 15 * 60:
-        due_sessions.append(("DAILY", session))
-
+        sessions.append(("DAILY", session, "OKX"))
+    # 4H sessions
     for h, m in [(1, 30), (5, 30), (9, 30), (13, 30), (17, 30), (21, 30)]:
         session = now.replace(hour=h, minute=m, second=0, microsecond=0)
         if 0 <= (now - session).total_seconds() <= 15 * 60:
-            due_sessions.append(("4H", session))
+            sessions.append(("4H", session, "OKX"))
+    return sessions
+
+def get_cme_4h_session_start(now):
+    days_since_monday = now.weekday()
+    monday_3am = now.replace(hour=3, minute=0, second=0, microsecond=0) - timedelta(days=days_since_monday)
+    if now < monday_3am:
+        monday_3am -= timedelta(days=7)
+    elapsed = (now - monday_3am).total_seconds()
+    session_start = monday_3am + timedelta(seconds=(elapsed // (4 * 3600)) * 4 * 3600)
+    return session_start
+
+def get_cme_session_times(now):
+    sessions = []
+    # Weekly Monday 3:00
+    if now.weekday() == 0:
+        session = now.replace(hour=3, minute=0, second=0, microsecond=0)
+        if 0 <= (now - session).total_seconds() <= 15 * 60:
+            sessions.append(("WEEKLY", session, "CME"))
+    # Daily 3:00
+    session = now.replace(hour=3, minute=0, second=0, microsecond=0)
+    if 0 <= (now - session).total_seconds() <= 15 * 60:
+        sessions.append(("DAILY", session, "CME"))
+    # 4H session
+    session = get_cme_4h_session_start(now)
+    if 0 <= (now - session).total_seconds() <= 15 * 60:
+        sessions.append(("4H", session, "CME"))
+    return sessions
+
+# ============ POC ALERTS (UPDATED WITH SEPARATE SESSIONS) ============
+def check_poc_alerts():
+    global poc_sent
+    now = datetime.now(IN_TZ)
+
+    all_sessions = []
+    all_sessions.extend(get_okx_session_times(now))
+    all_sessions.extend(get_cme_session_times(now))
 
     grouped = defaultdict(list)
-    for ptype, session in due_sessions:
-        key = session.strftime("%Y-%m-%d %H:%M")
-        if (ptype, key) in poc_sent:
+    for ptype, session, market in all_sessions:
+        key = f"{market}-{ptype}-{session.strftime('%Y-%m-%d %H:%M')}"
+        if key in poc_sent:
             continue
-        grouped[session].append(ptype)
+        grouped[(market, session)].append(ptype)
 
-    if not grouped:
-        return
-
-    for session, types in grouped.items():
-        if "WEEKLY" in types:
-            start_ms = int((session - timedelta(days=7)).timestamp() * 1000)
-        elif "DAILY" in types:
-            start_ms = int((session - timedelta(days=1)).timestamp() * 1000)
-        else:
-            start_ms = int((session - timedelta(hours=4)).timestamp() * 1000)
-
-        end_ms = int(session.timestamp() * 1000)
-        candles = get_1m_candles_range(start_ms, end_ms)
-        if candles is None:
-            print(f"❌ POC candles fetch failed for {session}")
-            continue
-
-        lines = []
+    for (market, session), types in grouped.items():
         for ptype in types:
-            poc = compute_poc_from_df(candles, start_ms, end_ms)
-            if poc is not None:
-                color_map = {"WEEKLY": "🟠", "DAILY": "🔵", "4H": "🩵"}
-                color = color_map.get(ptype, "⚪")
-                label = f"{color} {ptype} POC: ${poc:,.2f}"
-                lines.append(label)
+            if market == "OKX":
+                if ptype == "WEEKLY":
+                    start_ms = int((session - timedelta(days=7)).timestamp() * 1000)
+                elif ptype == "DAILY":
+                    start_ms = int((session - timedelta(days=1)).timestamp() * 1000)
+                elif ptype == "4H":
+                    start_ms = int((session - timedelta(hours=4)).timestamp() * 1000)
+                else:
+                    continue
+                end_ms = int(session.timestamp() * 1000)
+                candles = get_1m_candles_range(start_ms, end_ms)
+                if candles is None:
+                    print(f"⚠️ OKX 1m fetch failed for {ptype} at {session}")
+                    continue
+                poc = compute_poc_from_df(candles, start_ms, end_ms)
+                if poc is not None:
+                    update_poc_state_for_market("OKX", ptype, session, poc)
+                    color_map = {"WEEKLY": "🟠", "DAILY": "🔵", "4H": "🩵"}
+                    color = color_map.get(ptype, "⚪")
+                    label = f"{color} {ptype} POC: ${poc:,.2f}"
+                    msg = f"🕐 {session.strftime('%I:%M %p')} | {session.strftime('%Y-%m-%d')}\n"
+                    msg += "━━━━━━━━━━━━━━━\n"
+                    msg += label + "\n"
+                    msg += "━━━━━━━━━━━━━━━"
+                    try:
+                        send_telegram_sync(msg)
+                        print(f"✅ Sent OKX {ptype} POC alert for {session}")
+                    except Exception as e:
+                        print(f"❌ POC send error: {e}")
+            elif market == "CME":
+                if ptype == "WEEKLY":
+                    start_ms = int((session - timedelta(days=7)).timestamp() * 1000)
+                elif ptype == "DAILY":
+                    start_ms = int((session - timedelta(days=1)).timestamp() * 1000)
+                elif ptype == "4H":
+                    start_ms = int((session - timedelta(hours=4)).timestamp() * 1000)
+                else:
+                    continue
+                end_ms = int(session.timestamp() * 1000)
+                candles = get_yahoo_1m_range(CME_SYMBOL, start_ms, end_ms)
+                if candles is None:
+                    print(f"⚠️ CME 1m fetch failed for {ptype} at {session}")
+                    continue
+                poc = compute_poc_from_df(candles, start_ms, end_ms)
+                if poc is not None:
+                    update_poc_state_for_market("CME", ptype, session, poc)
+                    # We do not send CME POC label, only update state
 
-        if lines:
-            msg = f"🕐 {session.strftime('%I:%M %p')} | {session.strftime('%Y-%m-%d')}\n"
-            for label in lines:
-                msg += "━━━━━━━━━━━━━━━\n"
-                msg += label + "\n"
-            msg += "━━━━━━━━━━━━━━━"
-            try:
-                send_telegram_sync(msg)
-                print(f"✅ Sent POC alert for {session.strftime('%Y-%m-%d %H:%M')}")
-                for ptype in types:
-                    poc_sent.add((ptype, session.strftime("%Y-%m-%d %H:%M")))
-            except Exception as e:
-                print(f"❌ POC send error: {e}")
+            poc_sent.add(f"{market}-{ptype}-{session.strftime('%Y-%m-%d %H:%M')}")
+
+def update_poc_state_for_market(market, ptype, session, value):
+    if market == "OKX":
+        if ptype == "WEEKLY":
+            poc_state["OKX"]["weekly"] = value
+        elif ptype == "DAILY":
+            poc_state["OKX"]["daily"] = value
+        elif ptype == "4H":
+            poc_state["OKX"]["four_hour"] = value
+            poc_state["OKX"]["four_hour_session"] = session
+    elif market == "CME":
+        if ptype == "WEEKLY":
+            poc_state["CME"]["weekly"] = value
+        elif ptype == "DAILY":
+            poc_state["CME"]["daily"] = value
+        elif ptype == "4H":
+            poc_state["CME"]["four_hour"] = value
+            poc_state["CME"]["four_hour_session"] = session
 
 # ============ SIGNAL CALCULATION ============
 def calculate_signals(df):
@@ -947,21 +1023,9 @@ def check_compression_alerts():
             if key in compression_sent:
                 continue
 
-            weekly_start = open_time - 7*24*60*60*1000
-            daily_start = open_time - 24*60*60*1000
-            four_hour_start = open_time - 4*60*60*1000
-
-            if market == "OKX":
-                candles_1m = get_1m_candles_range(weekly_start, open_time)
-            else:
-                candles_1m = get_yahoo_1m_range(symbol, weekly_start, open_time)
-
-            if candles_1m is None:
-                continue
-
-            weekly_poc = compute_poc_from_df(candles_1m, weekly_start, open_time)
-            daily_poc = compute_poc_from_df(candles_1m, daily_start, open_time)
-            four_hour_poc = compute_poc_from_df(candles_1m, four_hour_start, open_time)
+            weekly_poc = poc_state[market]["weekly"]
+            daily_poc = poc_state[market]["daily"]
+            four_hour_poc = poc_state[market]["four_hour"]
 
             if None in (weekly_poc, daily_poc, four_hour_poc):
                 continue
@@ -1100,10 +1164,7 @@ def check_and_alert():
             else:
                 print("No signals on this candle.")
 
-    # POC alerts
     check_poc_alerts()
-
-    # Compression alerts
     check_compression_alerts()
 
 # ============ FLASK APP ============
